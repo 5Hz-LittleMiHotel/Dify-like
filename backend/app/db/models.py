@@ -1,0 +1,130 @@
+from datetime import datetime
+from uuid import uuid4
+
+from sqlalchemy import DateTime, ForeignKey, Integer, String, Text, func
+from sqlalchemy.dialects.postgresql import JSONB, UUID
+from sqlalchemy.orm import Mapped, mapped_column, relationship
+
+from app.db.session import Base
+
+
+def uuid_pk() -> Mapped[str]:
+    return mapped_column(UUID(as_uuid=False), primary_key=True, default=lambda: str(uuid4()))
+
+
+def now_col() -> Mapped[datetime]:
+    return mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class App(Base):
+    __tablename__ = "apps"
+
+    id: Mapped[str] = uuid_pk()
+    name: Mapped[str] = mapped_column(String(120), nullable=False)
+    description: Mapped[str] = mapped_column(Text, default="")
+    status: Mapped[str] = mapped_column(String(32), default="draft")
+    system_prompt: Mapped[str] = mapped_column(Text, default="")
+    model_provider: Mapped[str] = mapped_column(String(80), default="mock")
+    model_name: Mapped[str] = mapped_column(String(120), default="mock-react")
+    temperature: Mapped[int] = mapped_column(Integer, default=70)
+    top_p: Mapped[int] = mapped_column(Integer, default=100)
+    max_tokens: Mapped[int] = mapped_column(Integer, default=1024)
+    workflow_spec: Mapped[dict] = mapped_column(JSONB, default=dict)
+    created_at: Mapped[datetime] = now_col()
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+    tools: Mapped[list["AppTool"]] = relationship(back_populates="app", cascade="all, delete-orphan")
+    documents: Mapped[list["Document"]] = relationship(back_populates="app", cascade="all, delete-orphan")
+
+
+class AppTool(Base):
+    __tablename__ = "app_tools"
+
+    id: Mapped[str] = uuid_pk()
+    app_id: Mapped[str] = mapped_column(UUID(as_uuid=False), ForeignKey("apps.id", ondelete="CASCADE"))
+    tool_name: Mapped[str] = mapped_column(String(120), nullable=False)
+    enabled: Mapped[bool] = mapped_column(default=True)
+    config_json: Mapped[dict] = mapped_column(JSONB, default=dict)
+    created_at: Mapped[datetime] = now_col()
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+    app: Mapped[App] = relationship(back_populates="tools")
+
+
+class Document(Base):
+    __tablename__ = "documents"
+
+    id: Mapped[str] = uuid_pk()
+    app_id: Mapped[str] = mapped_column(UUID(as_uuid=False), ForeignKey("apps.id", ondelete="CASCADE"))
+    filename: Mapped[str] = mapped_column(String(255), nullable=False)
+    file_path: Mapped[str] = mapped_column(Text, nullable=False)
+    status: Mapped[str] = mapped_column(String(32), default="ready")
+    error: Mapped[str] = mapped_column(Text, default="")
+    created_at: Mapped[datetime] = now_col()
+
+    app: Mapped[App] = relationship(back_populates="documents")
+    chunks: Mapped[list["DocumentChunk"]] = relationship(back_populates="document", cascade="all, delete-orphan")
+
+
+class DocumentChunk(Base):
+    __tablename__ = "document_chunks"
+
+    id: Mapped[str] = uuid_pk()
+    document_id: Mapped[str] = mapped_column(UUID(as_uuid=False), ForeignKey("documents.id", ondelete="CASCADE"))
+    chunk_index: Mapped[int] = mapped_column(Integer, nullable=False)
+    content: Mapped[str] = mapped_column(Text, nullable=False)
+    metadata_json: Mapped[dict] = mapped_column(JSONB, default=dict)
+    created_at: Mapped[datetime] = now_col()
+
+    document: Mapped[Document] = relationship(back_populates="chunks")
+
+
+class Conversation(Base):
+    __tablename__ = "conversations"
+
+    id: Mapped[str] = uuid_pk()
+    app_id: Mapped[str] = mapped_column(UUID(as_uuid=False), ForeignKey("apps.id", ondelete="CASCADE"))
+    source: Mapped[str] = mapped_column(String(32), default="playground")
+    user_id: Mapped[str] = mapped_column(String(120), default="anonymous")
+    created_at: Mapped[datetime] = now_col()
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+
+class Message(Base):
+    __tablename__ = "messages"
+
+    id: Mapped[str] = uuid_pk()
+    conversation_id: Mapped[str] = mapped_column(UUID(as_uuid=False), ForeignKey("conversations.id", ondelete="CASCADE"))
+    role: Mapped[str] = mapped_column(String(32), nullable=False)
+    content: Mapped[str] = mapped_column(Text, nullable=False)
+    metadata_json: Mapped[dict] = mapped_column(JSONB, default=dict)
+    created_at: Mapped[datetime] = now_col()
+
+
+class Run(Base):
+    __tablename__ = "runs"
+
+    id: Mapped[str] = uuid_pk()
+    app_id: Mapped[str] = mapped_column(UUID(as_uuid=False), ForeignKey("apps.id", ondelete="CASCADE"))
+    conversation_id: Mapped[str] = mapped_column(UUID(as_uuid=False), ForeignKey("conversations.id", ondelete="CASCADE"))
+    input_message_id: Mapped[str | None] = mapped_column(UUID(as_uuid=False), nullable=True)
+    output_message_id: Mapped[str | None] = mapped_column(UUID(as_uuid=False), nullable=True)
+    status: Mapped[str] = mapped_column(String(32), default="running")
+    latency_ms: Mapped[int] = mapped_column(Integer, default=0)
+    error: Mapped[str] = mapped_column(Text, default="")
+    created_at: Mapped[datetime] = now_col()
+
+
+class RunStep(Base):
+    __tablename__ = "run_steps"
+
+    id: Mapped[str] = uuid_pk()
+    run_id: Mapped[str] = mapped_column(UUID(as_uuid=False), ForeignKey("runs.id", ondelete="CASCADE"))
+    type: Mapped[str] = mapped_column(String(32), nullable=False)
+    name: Mapped[str] = mapped_column(String(120), nullable=False)
+    input_json: Mapped[dict] = mapped_column(JSONB, default=dict)
+    output_json: Mapped[dict] = mapped_column(JSONB, default=dict)
+    latency_ms: Mapped[int] = mapped_column(Integer, default=0)
+    error: Mapped[str] = mapped_column(Text, default="")
+    started_at: Mapped[datetime] = now_col()
+    ended_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
