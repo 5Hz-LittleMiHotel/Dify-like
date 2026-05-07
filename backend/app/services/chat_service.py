@@ -1,112 +1,155 @@
-import json
-from collections.abc import AsyncIterator
-from time import perf_counter
+import json  # 用于把事件数据转成 JSON 字符串，方便 SSE 发送
+from collections.abc import AsyncIterator  # 用于标注异步生成器的返回类型
+from time import perf_counter  # 用于统计一次聊天运行耗时
 
-from sqlalchemy import select
-from sqlalchemy.orm import Session
+from sqlalchemy import select  # 用于构造 SQL 查询
+from sqlalchemy.orm import Session  # 数据库会话类型
 
-from app.db.models import Conversation, Message
-from app.runtime.workflow_executor import WorkflowExecutor
-from app.services.app_service import get_enabled_tool_names
-from app.services.run_log_service import add_step, create_run, finish_run
-
-
-def _sse(event: str, data: dict) -> str:
-    return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
+from app.db.models import Conversation, Message  # 导入会话和消息的数据库模型
+from app.runtime.workflow_executor import WorkflowExecutor  # 导入 workflow 执行器
+from app.services.app_service import get_enabled_tool_names  # 导入读取当前 app 已启用工具的函数
+from app.services.run_log_service import add_step, create_run, finish_run  # 导入 run 和 step 相关的日志服务
 
 
-def get_or_create_conversation(db: Session, app_id: str, conversation_id: str | None) -> Conversation:
-    if conversation_id:
-        conversation = db.get(Conversation, conversation_id)
-        if conversation:
-            return conversation
-    conversation = Conversation(app_id=app_id)
-    db.add(conversation)
-    db.commit()
-    db.refresh(conversation)
-    return conversation
+def _sse(event: str, data: dict) -> str:  # 把一个事件包装成 SSE 文本格式
+    return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"  # 按 SSE 协议拼出 event/data 块
 
 
-def add_message(db: Session, conversation_id: str, role: str, content: str, metadata_json: dict | None = None) -> Message:
-    message = Message(
-        conversation_id=conversation_id,
-        role=role,
-        content=content,
-        metadata_json=metadata_json or {},
+def get_or_create_conversation(db: Session, app_id: str, conversation_id: str | None) -> Conversation:  # 先找会话，找不到就创建
+    if conversation_id:  # 如果前端已经带了会话 id
+        conversation = db.get(Conversation, conversation_id)  # 直接按主键查现有会话
+        if conversation:  # 如果查到了
+            return conversation  # 直接复用这个会话
+    conversation = Conversation(app_id=app_id)  # 如果没有传，或者没查到，就创建一个新的会话
+    db.add(conversation)  # 加入当前事务
+    db.commit()  # 写入数据库
+    db.refresh(conversation)  # 刷新对象，拿到数据库生成的字段，比如 id
+    return conversation  # 返回会话对象
+
+
+def add_message(db: Session, conversation_id: str, role: str, content: str, metadata_json: dict | None = None) -> Message:  # 给会话新增一条消息
+    message = Message(  # 构造消息 ORM 对象
+        conversation_id=conversation_id,  # 这条消息属于哪个会话
+        role=role,  # 消息角色：user / assistant 等
+        content=content,  # 消息正文
+        metadata_json=metadata_json or {},  # 附加元数据，没有就用空字典
     )
-    db.add(message)
-    db.commit()
-    db.refresh(message)
-    return message
+    db.add(message)  # 加入事务
+    db.commit()  # 提交到数据库
+    db.refresh(message)  # 刷新对象，拿到数据库生成的 id 和时间
+    return message  # 返回新消息
 
 
-async def chat_once(db: Session, app, query: str, conversation_id: str | None = None) -> dict:
-    started = perf_counter()
-    conversation = get_or_create_conversation(db, app.id, conversation_id)
-    user_message = add_message(db, conversation.id, "user", query)
-    run = create_run(db, app.id, conversation.id, user_message.id)
+async def chat_once(db: Session, app, query: str, conversation_id: str | None = None) -> dict:  # 一次性聊天接口，返回完整结果
+    started = perf_counter()  # 记录开始时间，用于计算耗时
+    conversation = get_or_create_conversation(db, app.id, conversation_id)  # 获取或创建会话
+    user_message = add_message(db, conversation.id, "user", query)  # 先把用户输入存成一条消息
+    run = create_run(db, app.id, conversation.id, user_message.id)  # 创建一次 run 记录
 
-    enabled_tools = get_enabled_tool_names(db, app.id)
-    executor = WorkflowExecutor(db, app, run.id)
-    async for _event in executor.execute(query, enabled_tools):
-        pass
+    enabled_tools = get_enabled_tool_names(db, app.id)  # 查出当前 app 已启用的工具列表
+    executor = WorkflowExecutor(db, app, run.id)  # 创建 workflow 执行器，绑定这次 run
+    async for _event in executor.execute(query, enabled_tools):  # 执行 workflow，但这里不逐个处理事件
+        pass  # 一次性模式只关心最终结果，所以把中间事件忽略掉
 
-    output = add_message(
+    output = add_message(  # 把最终回答存成 assistant 消息
         db,
         conversation.id,
         "assistant",
-        executor.result.answer,
+        executor.result.answer,  # workflow 执行器累积出的最终答案
         {
-            "tool_calls": executor.result.tool_calls,
-            "retrieved_chunks": executor.result.retrieved_chunks,
+            "tool_calls": executor.result.tool_calls,  # 顺便把工具调用记录进消息元数据
+            "retrieved_chunks": executor.result.retrieved_chunks,  # 顺便把检索到的片段记录进消息元数据
         },
     )
-    finish_run(db, run, started, output_message_id=output.id)
-    return {
-        "conversation_id": conversation.id,
-        "run_id": run.id,
-        "answer": executor.result.answer,
-        "tool_calls": executor.result.tool_calls,
-        "retrieved_chunks": executor.result.retrieved_chunks,
+    finish_run(db, run, started, output_message_id=output.id)  # 结束 run，并写入输出消息 id 和耗时
+    return {  # 返回给调用方的完整结果
+        "conversation_id": conversation.id,  # 当前会话 id
+        "run_id": run.id,  # 当前运行 id
+        "answer": executor.result.answer,  # 最终答案
+        "tool_calls": executor.result.tool_calls,  # 工具调用列表
+        "retrieved_chunks": executor.result.retrieved_chunks,  # 检索结果列表
     }
 
 
-async def chat_stream(db: Session, app, query: str, conversation_id: str | None = None) -> AsyncIterator[str]:
-    started = perf_counter()
-    conversation = get_or_create_conversation(db, app.id, conversation_id)
-    user_message = add_message(db, conversation.id, "user", query)
-    run = create_run(db, app.id, conversation.id, user_message.id)
-    yield _sse("run_started", {"conversation_id": conversation.id, "run_id": run.id})
+async def chat_stream(db: Session, app, query: str, conversation_id: str | None = None) -> AsyncIterator[str]:  # 流式聊天接口，逐段输出 SSE
+    """
+    写在前面：
 
-    enabled_tools = get_enabled_tool_names(db, app.id)
-    executor = WorkflowExecutor(db, app, run.id)
-    final_sent = False
-    try:
-        async for event in executor.execute(query, enabled_tools):
-            if event["type"] == "retrieval":
+        函数流程：
+            1. 创建会话
+            2. 保存用户消息
+            3. 创建 run
+            4. 先 yield 一个 run_started
+            5. 让 WorkflowExecutor 跑 workflow
+            6. 每收到一个事件，就转成 SSE 再 yield 给前端
+            7. 收到 final 后，落库 assistant 消息，结束 run
+        
+        其中的变量内涵：
+            Conversation = 一整段对话
+            Message = 对话中的一条消息
+            Run = 针对某条用户消息的一次执行过程
+            RunStep = 这次执行过程里的每一步
+
+        举个例子：
+            Conversation A
+                Message 1: user: 我的订单 10086 到哪了？
+                Run 1: 执行这条用户消息
+                    RunStep: start
+                    RunStep: retrieval
+                    RunStep: tool_call
+                    RunStep: agent
+                    RunStep: end
+                Message 2: assistant: 订单 10086 已发货...
+
+        而run类中的字段可以这样理解：
+            id                 :这次运行的唯一 id。
+            app_id             :这次运行属于哪个 App。比如“电商客服 Agent”。
+            conversation_id    :这次运行属于哪个会话。
+            input_message_id   :这次 run 是由哪条用户消息触发的。
+            output_message_id  :这次 run 最终生成了哪条 assistant 消息。
+            status             :运行状态，比如默认 running，结束后变成 success，出错后变成 error。
+            latency_ms         :这次运行耗时多少毫秒。
+            error              :如果运行失败，这里记录错误信息。
+            created_at         :这次运行创建时间。
+
+        在 Dify 这类平台里，Run 就是一次执行的 trace 总入口。当前前端的 “Logs / 最近 Runs” 展示的就是这些记录。
+    """
+    started = perf_counter()  # 记录开始时间
+    conversation = get_or_create_conversation(db, app.id, conversation_id)  # 获取或创建会话
+    user_message = add_message(db, conversation.id, "user", query)  # 保存用户消息
+    run = create_run(db, app.id, conversation.id, user_message.id)  # 创建 run 记录 （可以理解成一次 workflow 执行记录）
+
+    yield _sse("run_started", {"conversation_id": conversation.id, "run_id": run.id})  # 先告诉前端 run 已开始
+
+    enabled_tools = get_enabled_tool_names(db, app.id)  # 取出当前 app 可用工具
+    executor = WorkflowExecutor(db, app, run.id)  # 创建 workflow 执行器
+    final_sent = False  # 标记是否已经收到了 final 事件
+    try:  # 这里包一层，避免运行时异常直接把流打断
+        async for event in executor.execute(query, enabled_tools):  # 依次接收 workflow 的事件
+            if event["type"] == "retrieval":  # 如果是检索事件，转成 SSE 发给前端
                 yield _sse("retrieval", event)
-            elif event["type"] == "tool_call":
+            elif event["type"] == "tool_call":  # 如果是工具调用事件，转成 SSE 发给前端
                 yield _sse("tool_call", event)
-            elif event["type"] == "message_delta":
+            elif event["type"] == "message_delta":  # 如果是模型输出的增量文本，只把增量内容发给前端
                 yield _sse("message_delta", {"content": event["content"]})
-            elif event["type"] == "workflow_warning":
+            elif event["type"] == "workflow_warning":  # 如果是 workflow 警告，转成 SSE 发给前端
                 yield _sse("workflow_warning", event)
-            elif event["type"] == "adapter_error":
+            elif event["type"] == "adapter_error":  # 如果是 agent adapter 错误，把错误发给前端
                 yield _sse("error", {"message": event["message"], "adapter": event["adapter"]})
-            elif event["type"] == "final":
+            elif event["type"] == "final":  # 如果收到了最终答案，标记 final 已经处理过
                 final_sent = True
-                output = add_message(
+                output = add_message(  # 把最终答案写入 assistant 消息表
                     db,
                     conversation.id,
                     "assistant",
                     str(event["content"]),
                     {
-                        "tool_calls": executor.result.tool_calls,
-                        "retrieved_chunks": executor.result.retrieved_chunks,
+                        "tool_calls": executor.result.tool_calls,  # 保存工具调用记录
+                        "retrieved_chunks": executor.result.retrieved_chunks,  # 保存检索记录
                     },
                 )
-                finish_run(db, run, started, output_message_id=output.id)
-                yield _sse(
+                finish_run(db, run, started, output_message_id=output.id)  # 完成 run，记录输出消息和耗时
+                yield _sse(  # 把 final 结果再发给前端，前端据此结束流式展示
                     "final",
                     {
                         "conversation_id": conversation.id,
@@ -117,8 +160,8 @@ async def chat_stream(db: Session, app, query: str, conversation_id: str | None 
                     },
                 )
 
-        if not final_sent:
-            output = add_message(
+        if not final_sent:  # 如果 workflow 没有主动发 final，说明需要在这里兜底收尾
+            output = add_message(  # 仍然把当前累积答案写入 assistant 消息
                 db,
                 conversation.id,
                 "assistant",
@@ -128,8 +171,8 @@ async def chat_stream(db: Session, app, query: str, conversation_id: str | None 
                     "retrieved_chunks": executor.result.retrieved_chunks,
                 },
             )
-            finish_run(db, run, started, output_message_id=output.id)
-            yield _sse(
+            finish_run(db, run, started, output_message_id=output.id)  # 结束 run
+            yield _sse(  # 再发一个 final 给前端
                 "final",
                 {
                     "conversation_id": conversation.id,
@@ -139,11 +182,11 @@ async def chat_stream(db: Session, app, query: str, conversation_id: str | None 
                     "retrieved_chunks": executor.result.retrieved_chunks,
                 },
             )
-    except Exception as exc:
-        finish_run(db, run, started, status="error", error=str(exc))
-        add_step(db, run.id, "error", "runtime_error", {}, {}, error=str(exc))
-        yield _sse("error", {"message": str(exc)})
+    except Exception as exc:  # 如果运行过程出错
+        finish_run(db, run, started, status="error", error=str(exc))  # 把 run 标记为失败
+        add_step(db, run.id, "error", "runtime_error", {}, {}, error=str(exc))  # 额外写一条错误 step 方便排查
+        yield _sse("error", {"message": str(exc)})  # 把错误消息发给前端
 
 
-def list_messages(db: Session, conversation_id: str) -> list[Message]:
-    return list(db.scalars(select(Message).where(Message.conversation_id == conversation_id).order_by(Message.created_at.asc())))
+def list_messages(db: Session, conversation_id: str) -> list[Message]:  # 查询某个会话的全部消息
+    return list(db.scalars(select(Message).where(Message.conversation_id == conversation_id).order_by(Message.created_at.asc())))  # 按时间正序返回消息列表
