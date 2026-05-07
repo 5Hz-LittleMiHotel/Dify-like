@@ -87,34 +87,22 @@ docker compose down -v
 cd F:\my_folder\Work\LLM\Project\Dify-like\backend
 ```
 
-创建虚拟环境：
-
-```powershell
-python -m venv .venv
-```
-
 激活虚拟环境：
 
 ```powershell
-.\.venv\Scripts\Activate.ps1
-```
-
-如果 PowerShell 不允许执行脚本，可以改用：
-
-```powershell
-.\.venv\Scripts\python.exe -m pip install -e .
+conda activate dify
 ```
 
 安装依赖：
 
 ```powershell
-pip install -e .
+python -m pip install -e .
 ```
 
 启动后端：
 
 ```powershell
-uvicorn app.main:app --reload --port 8000
+python -m uvicorn app.main:app --reload --port 8000
 ```
 
 健康检查：
