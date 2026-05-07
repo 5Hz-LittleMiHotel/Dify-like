@@ -7,7 +7,7 @@ from pydantic import BaseModel, Field
 DEFAULT_WORKFLOW_SPEC = {
     "nodes": [
         {"id": "start", "type": "start"},
-        {"id": "retrieval", "type": "retrieval", "enabled": True},
+        {"id": "retrieval", "type": "retrieval", "enabled": True, "top_k": 3},
         {"id": "agent", "type": "react_agent"},
         {"id": "end", "type": "end"},
     ],

@@ -6,9 +6,8 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.db.models import Conversation, Message
-from app.runtime.agent_runner import AgentRunner
+from app.runtime.workflow_executor import WorkflowExecutor
 from app.services.app_service import get_enabled_tool_names
-from app.services.rag_service import retrieve_chunks
 from app.services.run_log_service import add_step, create_run, finish_run
 
 
@@ -47,41 +46,28 @@ async def chat_once(db: Session, app, query: str, conversation_id: str | None = 
     user_message = add_message(db, conversation.id, "user", query)
     run = create_run(db, app.id, conversation.id, user_message.id)
 
-    retrieved = retrieve_chunks(db, app.id, query)
-    add_step(db, run.id, "retrieval", "default_retrieval", {"query": query}, {"chunks": retrieved})
-
     enabled_tools = get_enabled_tool_names(db, app.id)
-    runner = AgentRunner()
-    tool_calls = []
-    answer = ""
-    async for event in runner.run(query, app.system_prompt, enabled_tools, retrieved):
-        if event["type"] == "tool_call":
-            tool_calls.append(event)
-            add_step(
-                db,
-                run.id,
-                "tool_call",
-                event["name"],
-                event["input"],
-                event["output"],
-            )
-        elif event["type"] == "final":
-            answer = event["content"]
+    executor = WorkflowExecutor(db, app, run.id)
+    async for _event in executor.execute(query, enabled_tools):
+        pass
 
     output = add_message(
         db,
         conversation.id,
         "assistant",
-        answer,
-        {"tool_calls": tool_calls, "retrieved_chunks": retrieved},
+        executor.result.answer,
+        {
+            "tool_calls": executor.result.tool_calls,
+            "retrieved_chunks": executor.result.retrieved_chunks,
+        },
     )
     finish_run(db, run, started, output_message_id=output.id)
     return {
         "conversation_id": conversation.id,
         "run_id": run.id,
-        "answer": answer,
-        "tool_calls": tool_calls,
-        "retrieved_chunks": retrieved,
+        "answer": executor.result.answer,
+        "tool_calls": executor.result.tool_calls,
+        "retrieved_chunks": executor.result.retrieved_chunks,
     }
 
 
@@ -92,31 +78,32 @@ async def chat_stream(db: Session, app, query: str, conversation_id: str | None 
     run = create_run(db, app.id, conversation.id, user_message.id)
     yield _sse("run_started", {"conversation_id": conversation.id, "run_id": run.id})
 
-    retrieved = retrieve_chunks(db, app.id, query)
-    add_step(db, run.id, "retrieval", "default_retrieval", {"query": query}, {"chunks": retrieved})
-    yield _sse("retrieval", {"chunks": retrieved})
-
     enabled_tools = get_enabled_tool_names(db, app.id)
-    runner = AgentRunner()
-    tool_calls = []
-    deltas = []
+    executor = WorkflowExecutor(db, app, run.id)
+    final_sent = False
     try:
-        async for event in runner.run(query, app.system_prompt, enabled_tools, retrieved):
-            if event["type"] == "tool_call":
-                tool_calls.append(event)
-                add_step(db, run.id, "tool_call", event["name"], event["input"], event["output"])
+        async for event in executor.execute(query, enabled_tools):
+            if event["type"] == "retrieval":
+                yield _sse("retrieval", event)
+            elif event["type"] == "tool_call":
                 yield _sse("tool_call", event)
             elif event["type"] == "message_delta":
-                deltas.append(event["content"])
                 yield _sse("message_delta", {"content": event["content"]})
+            elif event["type"] == "workflow_warning":
+                yield _sse("workflow_warning", event)
+            elif event["type"] == "adapter_error":
+                yield _sse("error", {"message": event["message"], "adapter": event["adapter"]})
             elif event["type"] == "final":
-                answer = event["content"]
+                final_sent = True
                 output = add_message(
                     db,
                     conversation.id,
                     "assistant",
-                    answer,
-                    {"tool_calls": tool_calls, "retrieved_chunks": retrieved},
+                    str(event["content"]),
+                    {
+                        "tool_calls": executor.result.tool_calls,
+                        "retrieved_chunks": executor.result.retrieved_chunks,
+                    },
                 )
                 finish_run(db, run, started, output_message_id=output.id)
                 yield _sse(
@@ -124,11 +111,34 @@ async def chat_stream(db: Session, app, query: str, conversation_id: str | None 
                     {
                         "conversation_id": conversation.id,
                         "run_id": run.id,
-                        "answer": answer,
-                        "tool_calls": tool_calls,
-                        "retrieved_chunks": retrieved,
+                        "answer": event["content"],
+                        "tool_calls": executor.result.tool_calls,
+                        "retrieved_chunks": executor.result.retrieved_chunks,
                     },
                 )
+
+        if not final_sent:
+            output = add_message(
+                db,
+                conversation.id,
+                "assistant",
+                executor.result.answer,
+                {
+                    "tool_calls": executor.result.tool_calls,
+                    "retrieved_chunks": executor.result.retrieved_chunks,
+                },
+            )
+            finish_run(db, run, started, output_message_id=output.id)
+            yield _sse(
+                "final",
+                {
+                    "conversation_id": conversation.id,
+                    "run_id": run.id,
+                    "answer": executor.result.answer,
+                    "tool_calls": executor.result.tool_calls,
+                    "retrieved_chunks": executor.result.retrieved_chunks,
+                },
+            )
     except Exception as exc:
         finish_run(db, run, started, status="error", error=str(exc))
         add_step(db, run.id, "error", "runtime_error", {}, {}, error=str(exc))
