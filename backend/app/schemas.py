@@ -16,15 +16,19 @@ DEFAULT_WORKFLOW_SPEC = {
 
 
 class AppCreate(BaseModel):
+    # 这是“创建 App 请求体”的数据结构，不是数据库对象本身。
+    # FastAPI 会根据它校验前端传来的 JSON，并在缺省字段时自动补上这里的默认值。
+    # 目前这些默认值是 MVP 阶段的创建页预设，用来快速生成一个可运行的 demo app。
+    # 等产品成熟后，默认值通常应来自前端模板、产品配置或创建向导，而不是长期硬编码在 schema 里。
     name: str = Field(min_length=1, max_length=120)
     description: str = ""
-    system_prompt: str = "你是一个专业、耐心的电商客服智能体。"
-    model_provider: str = "mock"
-    model_name: str = "mock-react"
-    temperature: int = 70
-    top_p: int = 100
-    max_tokens: int = 1024
-    workflow_spec: dict[str, Any] = Field(default_factory=lambda: DEFAULT_WORKFLOW_SPEC.copy())
+    system_prompt: str = "你是一个专业、耐心的电商客服智能体。"  # MVP 默认 prompt，后续可改成模板/配置驱动
+    model_provider: str = "mock"  # MVP 默认模型提供方，后续应由用户选择或从配置读取
+    model_name: str = "mock-react"  # MVP 默认模型名，后续应由用户选择或从配置读取
+    temperature: int = 70  # MVP 默认采样参数
+    top_p: int = 100  # MVP 默认采样参数
+    max_tokens: int = 1024  # MVP 默认输出长度限制
+    workflow_spec: dict[str, Any] = Field(default_factory=lambda: DEFAULT_WORKFLOW_SPEC.copy())  # MVP 默认 workflow，后续可改为模板或可视化编辑结果
 
 
 class AppUpdate(BaseModel):
