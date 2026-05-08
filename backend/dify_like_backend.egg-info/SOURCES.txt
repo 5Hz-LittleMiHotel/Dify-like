@@ -15,7 +15,9 @@ app/db/__init__.py
 app/db/models.py
 app/db/session.py
 app/runtime/__init__.py
+app/runtime/agent_adapters.py
 app/runtime/agent_runner.py
+app/runtime/workflow_executor.py
 app/services/__init__.py
 app/services/app_service.py
 app/services/chat_service.py
