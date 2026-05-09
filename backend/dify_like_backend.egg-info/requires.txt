@@ -8,4 +8,4 @@ python-multipart>=0.0.9
 sse-starlette>=2.1.0
 
 [agentscope]
-agentscope>=1.0.0
+agentscope[full]==1.0.19.post1

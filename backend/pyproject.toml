@@ -16,7 +16,7 @@ dependencies = [
 
 [project.optional-dependencies]
 agentscope = [
-  "agentscope>=1.0.0",
+  "agentscope[full]==1.0.19.post1",
 ]
 
 [tool.setuptools.packages.find]
