@@ -107,10 +107,14 @@ class WorkflowExecutor:
         yield event
 
     async def _execute_agent(self, node: dict[str, Any], context: dict[str, Any]) -> AsyncIterator[RuntimeEvent]:
+        # 记录 agent 节点开始时间
         started = perf_counter()
+        # 读取节点级配置
         adapter_name = node.get("adapter")
         model_config = node.get("model", {})
+        # 决定使用哪个 agent adapter
         adapter = build_agent_adapter(adapter_name, model_config.get("provider") or self.app.model_provider)
+        # 构造 AgentInvocation, agent runtime 的输入包. 作用：WorkflowExecutor 把 workflow 前面准备好的东西打包，然后交给 agent adapter
         invocation = AgentInvocation(
             app_name=self.app.name,
             query=context["query"],
@@ -120,10 +124,11 @@ class WorkflowExecutor:
             model_config=model_config,
             node_config=node,
             enabled_tools=context["enabled_tools"],
-            retrieved_chunks=self.result.retrieved_chunks,
+            retrieved_chunks=self.result.retrieved_chunks, # retrieval 节点检索到的片段在这里传给 agent
         )
 
         final_answer = ""
+        # 跑 adapter，并处理事件
         async for event in adapter.run(invocation):
             if event["type"] == "tool_call":
                 self.result.tool_calls.append(event)
@@ -141,7 +146,7 @@ class WorkflowExecutor:
             elif event["type"] == "adapter_error":
                 add_step(self.db, self.run_id, "error", "agent_adapter", {"node": node}, event, error=event["message"])
             yield event
-
+        # 最后，写一个 agent step，表示这个 agent 节点整体跑完了：
         add_step(
             self.db,
             self.run_id,
@@ -191,6 +196,7 @@ class WorkflowExecutor:
         return ordered
 
     def _normalize_type(self, node_type: str) -> str:
+        # 它不是在“完整标准化所有节点类型”，而是在处理当前唯一的同义词。其他类型要么已经是标准名，要么本来就该被当成未知节点。
         if node_type in {"agent", "react_agent"}:
             return "agent"
         return node_type

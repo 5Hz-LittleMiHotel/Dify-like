@@ -78,10 +78,13 @@ class AgentScopeAdapter(BaseAgentAdapter):
     name = "agentscope"
 
     async def run(self, invocation: AgentInvocation) -> AsyncIterator[RuntimeEvent]:
+        # 函数作用：把项目内部的 AgentInvocation 转成 AgentScope 调用，再把 AgentScope 的输出转回项目统一的 RuntimeEvent。
         try:
+            # 1.创建 AgentScope agent
             agent = self._create_agent(invocation)
-            from agentscope.message import Msg
-            from agentscope.pipeline import stream_printing_messages
+            # 2.导入 AgentScope 的消息和流式工具:
+            from agentscope.message import Msg  # Msg 用来把用户输入包装成 AgentScope 能识别的消息
+            from agentscope.pipeline import stream_printing_messages  # stream_printing_messages 用来接收 AgentScope 运行中的流式输出。
         except Exception as exc:
             yield {
                 "type": "adapter_error",
@@ -89,13 +92,27 @@ class AgentScopeAdapter(BaseAgentAdapter):
                 "message": str(exc),
             }
             return
-
-        agent.set_console_output_enabled(False)
-        task = agent(Msg("user", invocation.query, "user"))
+        # 3.调用 AgentScope agent, 真正把用户问题交给 AgentScope
+        agent.set_console_output_enabled(False)  # 关闭 AgentScope 自己往控制台打印
+        task = agent(Msg("user", invocation.query, "user"))  # 把用户输入包装成一条 user 消息, 启动 AgentScope 的 ReActAgent 执行, task 会被交给 stream_printing_messages() 去流式消费
         previous = ""
+        # 4.把 AgentScope 输出(Msg流)转换成项目事件(RuntimeEvent流), 是 adapter 的核心：
+        """
+        AgentScope 给出的可能是“当前完整文本”，而前端需要的是“增量文本”。
+        所以代码用 previous 记录上一次文本，然后算出这次新增的部分 delta。
+        然后它把 AgentScope 的输出转成项目统一事件：
 
+        有新增内容 -> yield message_delta
+        最后一条消息 -> yield final
+
+        上层 WorkflowExecutor 和 chat_stream() 不需要知道 AgentScope 的内部细节，只要继续处理这些统一事件即可。
+        """
+        # 一边运行 task，一边捕获 AgentScope agent 打印出来的流式消息：
+        # 其中last是一个bool，表示是否为当前流式消息的最后一块。
+        # 当前 MVP 用它来触发final，可以跑通简单场景；后面真实接 ReAct、工具、多段消息时，可以再检查它是否会过早触发 final
         async for msg, last in stream_printing_messages(agents=[agent], coroutine_task=task):
             current = msg.get_text_content()
+            # delta 是从累计文本里切出来的新增文本片段。前端只需要不断 append delta，就能形成流式输出。
             delta = current[len(previous) :] if current.startswith(previous) else current
             previous = current
             if delta:
@@ -104,14 +121,24 @@ class AgentScopeAdapter(BaseAgentAdapter):
                 yield {"type": "final", "content": current}
 
     def _create_agent(self, invocation: AgentInvocation):
+        """
+        创建模型
+        创建 formatter
+        创建 Toolkit
+        注册平台工具
+        拼 system prompt
+        创建 ReActAgent
+        """
         from agentscope.agent import ReActAgent
         from agentscope.memory import InMemoryMemory
         from agentscope.tool import Toolkit
 
-        model, formatter = self._build_model_and_formatter(invocation)
-        toolkit = Toolkit()
-        for tool_name in invocation.enabled_tools:
+        model, formatter = self._build_model_and_formatter(invocation)  # formatter 是 LLM 消息协议适配器，告诉 AgentScope 怎么把消息整理给这个品牌的LLM模型
+        toolkit = Toolkit()  # 创建空工具箱
+        for tool_name in invocation.enabled_tools:  # 把当前 app 启用的工具注册进工具箱，这些平台工具就会被包装成 AgentScope 可以调用的函数
             toolkit.register_tool_function(self._make_agentscope_tool(tool_name))
+            # register_tool_function() 虽然源码很长，但核心就一句话：
+            # 把一个 Python 函数解析成 AgentScope 能理解的工具对象，然后存进 toolkit.tools 字典里。
 
         sys_prompt = self._build_system_prompt(invocation)
         return ReActAgent(
@@ -164,7 +191,9 @@ class AgentScopeAdapter(BaseAgentAdapter):
         return f"{invocation.system_prompt}\n\nKnowledge context:\n{context}"
 
     def _make_agentscope_tool(self, tool_name: str):
+        # 函数的作用是把本平台里的工具名，包装成一个 AgentScope 可以注册和调用的 Python 函数。
         def platform_tool(**kwargs: Any):
+            # 这个 platform_tool 就是最终注册进 AgentScope Toolkit 的工具函数（当 AgentScope agent 决定调用工具时，实际调用就是platform_tool(kwargs)）
             """Run a platform managed tool.
 
             Args:
@@ -173,9 +202,12 @@ class AgentScopeAdapter(BaseAgentAdapter):
             from agentscope.message import TextBlock
             from agentscope.tool import ToolResponse
 
+            # 函数定义里是**kwargs, 所以调用本项目工具的这些参数会被收集成字典: kwargs = {"key": "value"}; 然后下面会调用本项目自己的工具系统, 返回一个dict格式结果
             result = run_tool(tool_name, kwargs)
+            # 把上一行代码的结果转成 AgentScope 认识的工具响应格式: 先包成 TextBlock, 再包成 ToolResponse, 返回给 AgentScope agent
             return ToolResponse(content=[TextBlock(type="text", text=str(result))])
-
+        
+        # 在 Python 里，函数也是对象。这里修改包装过的函数对象的名称。否则默认为platform_tool，则加入到toolkit后所有工具函数都叫 platform_tool
         platform_tool.__name__ = tool_name
         return platform_tool
 

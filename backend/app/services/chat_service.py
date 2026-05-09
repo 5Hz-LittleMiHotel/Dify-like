@@ -13,6 +13,11 @@ from app.services.run_log_service import add_step, create_run, finish_run  # 导
 
 def _sse(event: str, data: dict) -> str:  # 把一个事件包装成 SSE 文本格式
     return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"  # 按 SSE 协议拼出 event/data 块
+    """
+    SSE 的基本格式：
+        event: run_started
+        data: {"conversation_id": "...", "run_id": "..."}
+    """
 
 
 def get_or_create_conversation(db: Session, app_id: str, conversation_id: str | None) -> Conversation:  # 先找会话，找不到就创建
@@ -74,7 +79,7 @@ async def chat_once(db: Session, app, query: str, conversation_id: str | None = 
 async def chat_stream(db: Session, app, query: str, conversation_id: str | None = None) -> AsyncIterator[str]:  # 流式聊天接口，逐段输出 SSE
     """
     写在前面：
-
+    整个函数的作用是接住 workflow_executor 吐出来的事件，再转成 SSE 发给前端。
         函数流程：
             1. 创建会话
             2. 保存用户消息
@@ -87,8 +92,8 @@ async def chat_stream(db: Session, app, query: str, conversation_id: str | None 
         其中的变量内涵：
             Conversation = 一整段对话
             Message = 对话中的一条消息
-            Run = 针对某条用户消息的一次执行过程
-            RunStep = 这次执行过程里的每一步
+            Run = 针对某条用户消息的一次 workflow 执行过程
+            RunStep = 这次执行过程里的每一步 trace
 
         举个例子：
             Conversation A
@@ -120,11 +125,18 @@ async def chat_stream(db: Session, app, query: str, conversation_id: str | None 
     run = create_run(db, app.id, conversation.id, user_message.id)  # 创建 run 记录 （可以理解成一次 workflow 执行记录）
 
     yield _sse("run_started", {"conversation_id": conversation.id, "run_id": run.id})  # 先告诉前端 run 已开始
-
+    """
+    yield 的作用是边做边交卷（return 是一次性交卷）。例如：
+        def demo():
+            yield 1
+            yield 2
+            yield 3
+    这个函数不会一次性返回 1, 2, 3，而是变成一个生成器，外面可以逐个拿到值。
+    """
     enabled_tools = get_enabled_tool_names(db, app.id)  # 取出当前 app 可用工具
     executor = WorkflowExecutor(db, app, run.id)  # 创建 workflow 执行器
     final_sent = False  # 标记是否已经收到了 final 事件
-    try:  # 这里包一层，避免运行时异常直接把流打断
+    try:  # try能避免运行时异常直接把流打断
         async for event in executor.execute(query, enabled_tools):  # 依次接收 workflow 的事件
             if event["type"] == "retrieval":  # 如果是检索事件，转成 SSE 发给前端
                 yield _sse("retrieval", event)
