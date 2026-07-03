@@ -7,7 +7,12 @@ from typing import Any
 
 from app.db.models import Run
 from app.db.session import SessionLocal
+from app.runtime.runtime_command_subscriber import get_runtime_command_subscriber
 from app.services.execution_event_service import append_run_event, list_pending_commands, mark_command_processed
+
+
+COMMAND_FALLBACK_POLL_SECONDS = 3.0
+SUBSCRIPTION_CONFIRM_TIMEOUT_SECONDS = 1.0
 
 
 class ExecutionControl:
@@ -19,14 +24,28 @@ class ExecutionControl:
         self._session: Any = None
         self._monitor_task: asyncio.Task | None = None
         self._interrupt_task: asyncio.Task | None = None
+        self._command_wakeup = asyncio.Event()
+        self._command_scan_lock = asyncio.Lock()
+        self._subscriber_registered = False
         self._closed = False
         self._interrupt_sent = False
 
     async def start(self) -> None:
-        self._consume_commands()
+        await self._consume_commands()
+        subscriber = get_runtime_command_subscriber()
+        await subscriber.register(
+            self.run_id,
+            self._command_wakeup,
+            timeout=SUBSCRIPTION_CONFIRM_TIMEOUT_SECONDS,
+        )
+        self._subscriber_registered = True
+        await self._consume_commands()
         self._monitor_task = asyncio.create_task(self._monitor())
 
     async def close(self) -> None:
+        if self._subscriber_registered:
+            get_runtime_command_subscriber().unregister(self.run_id)
+            self._subscriber_registered = False
         self._closed = True
         if self._monitor_task:
             self._monitor_task.cancel()
@@ -63,14 +82,16 @@ class ExecutionControl:
         return self._resume_inputs.popleft()
 
     async def wait_for_resume_input(self, timeout: float = 1.0) -> tuple[str, str] | None:
-        deadline = asyncio.get_running_loop().time() + timeout
-        while asyncio.get_running_loop().time() < deadline:
-            self._consume_commands()
-            resume_input = self.pop_resume_input()
-            if resume_input is not None:
-                return resume_input
-            await asyncio.sleep(0.1)
-        return None
+        resume_input = self.pop_resume_input()
+        if resume_input is not None:
+            return resume_input
+        try:
+            await asyncio.wait_for(self._command_wakeup.wait(), timeout=timeout)
+        except asyncio.TimeoutError:
+            pass
+        self._command_wakeup.clear()
+        await self._consume_commands()
+        return self.pop_resume_input()
 
     def checkpoint_agent(self) -> dict[str, Any] | None:
         if self._session is None:
@@ -79,15 +100,35 @@ class ExecutionControl:
 
     async def _monitor(self) -> None:
         while not self._closed:
-            self._consume_commands()
+            try:
+                await asyncio.wait_for(
+                    self._command_wakeup.wait(),
+                    timeout=COMMAND_FALLBACK_POLL_SECONDS,
+                )
+            except asyncio.TimeoutError:
+                pass
+            self._command_wakeup.clear()
+            await self._consume_commands()
             self._interrupt_if_needed()
-            await asyncio.sleep(0.25)
 
-    def _consume_commands(self) -> None:
+    async def _consume_commands(self) -> None:
+        async with self._command_scan_lock:
+            commands = await asyncio.to_thread(self._consume_commands_from_db, self.phase)
+            for command_type, payload in commands:
+                if command_type == "interrupt":
+                    self.stop_requested = True
+                elif command_type == "guidance":
+                    content = str(payload.get("content") or "").strip()
+                    if content:
+                        self._resume_inputs.append(("guidance", content))
+                elif command_type == "continue":
+                    self._resume_inputs.append(("continue", ""))
+
+    def _consume_commands_from_db(self, phase: str) -> list[tuple[str, dict[str, Any]]]:
+        consumed: list[tuple[str, dict[str, Any]]] = []
         with SessionLocal() as db:
             for command in list_pending_commands(db, self.run_id):
                 if command.command_type == "interrupt":
-                    self.stop_requested = True
                     run = db.get(Run, self.run_id)
                     if run and run.status == "running":
                         run.status = "interrupt_requested"
@@ -97,15 +138,11 @@ class ExecutionControl:
                         db,
                         self.run_id,
                         "interrupt_requested",
-                        {"run_id": self.run_id, "phase": self.phase},
+                        {"run_id": self.run_id, "phase": phase},
                     )
-                elif command.command_type == "guidance":
-                    content = str(command.payload_json.get("content") or "").strip()
-                    if content:
-                        self._resume_inputs.append(("guidance", content))
-                elif command.command_type == "continue":
-                    self._resume_inputs.append(("continue", ""))
+                consumed.append((command.command_type, dict(command.payload_json or {})))
                 mark_command_processed(db, command)
+        return consumed
 
     def _interrupt_if_needed(self) -> None:
         if self._session is None or self._interrupt_sent:

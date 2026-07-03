@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from celery import Celery
-from celery.signals import worker_process_init
+from celery.signals import worker_process_init, worker_process_shutdown
 
 from app.core.config import get_settings, initialize_agentscope_tracing
 
@@ -14,6 +14,13 @@ app = celery_app
 @worker_process_init.connect
 def initialize_worker_runtime(**_kwargs) -> None:
     initialize_agentscope_tracing(settings)
+
+
+@worker_process_shutdown.connect
+def shutdown_worker_runtime(**_kwargs) -> None:
+    from app.runtime.runtime_command_subscriber import shutdown_runtime_command_subscriber
+
+    shutdown_runtime_command_subscriber()
 
 
 @celery_app.task(name="knowledge_database.process_document")
