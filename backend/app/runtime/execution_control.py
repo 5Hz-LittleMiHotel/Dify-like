@@ -18,6 +18,7 @@ class ExecutionControl:
         self._guidance: deque[str] = deque()
         self._session: Any = None
         self._monitor_task: asyncio.Task | None = None
+        self._interrupt_task: asyncio.Task | None = None
         self._closed = False
         self._interrupt_sent = False
 
@@ -33,10 +34,13 @@ class ExecutionControl:
                 await self._monitor_task
             except asyncio.CancelledError:
                 pass
+        if self._interrupt_task:
+            await self._interrupt_task
 
     def register_session(self, session: Any) -> None:
         self._session = session
         self._interrupt_sent = False
+        self._interrupt_task = None
 
     def set_phase(self, phase: str) -> None:
         self.phase = phase
@@ -108,5 +112,5 @@ class ExecutionControl:
             return
         if self.phase not in {"thinking", "streaming", "agent"}:
             return
-        self._session.interrupt()
+        self._interrupt_task = asyncio.create_task(self._session.interrupt())
         self._interrupt_sent = True

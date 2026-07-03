@@ -41,8 +41,8 @@ class AgentScopeSession:
         self.adapter = adapter
         self.agent = agent
 
-    def interrupt(self) -> None:
-        self.agent.interrupt()
+    async def interrupt(self) -> None:
+        await self.agent.interrupt()
 
     def state_dict(self) -> dict[str, Any]:
         return self.agent.state_dict()
