@@ -2102,3 +2102,384 @@ source_skill_id = 原私有 skill id
 - 不运行用户 workflow
 
 它只是帮平台助手“检索、选择、逐步读取 skill 内容”，再让平台助手生成建议或 workflow draft。真正写入 app/workflow 时仍走后端业务服务和 schema/权限校验。
+
+## celery worker与redis
+
+### **Celery Worker 是什么**
+
+Celery 是 Python 的分布式任务队列框架。Celery Worker 是一个独立运行的进程，负责从任务队列中取出任务并执行。
+
+它和 FastAPI 是两个不同的进程：
+
+```text
+FastAPI：接收 HTTP 请求
+Celery Worker：执行耗时任务
+```
+
+**基本组成**
+
+Celery 通常包含四部分：
+
+1. 任务生产者  
+   创建任务的一方，例如 FastAPI。
+
+2. Broker  
+   保存待执行任务的消息队列。你的项目使用 Redis。
+
+3. Celery Worker  
+   从 Redis 读取任务，并调用对应的 Python 函数。
+
+4. Result Backend  
+   保存 Celery 任务自身的结果和状态。也可以使用 Redis。
+
+### **一次任务的完整流程**
+
+用户发送聊天请求后：
+
+```text
+FastAPI 接收请求
+→ 创建 Run
+→ 将 run_id 写入 Celery 任务消息
+→ 消息进入 Redis
+→ FastAPI 立即返回 run_id
+→ Celery Worker 从 Redis 获取任务
+→ Worker 执行 execute_workflow_run(run_id)
+→ 从数据库读取 Run 和 Workflow
+→ 执行 AgentScope
+→ 将事件和最终结果写入数据库
+```
+
+发送任务的代码类似：
+
+```python
+execute_workflow_run.delay(run_id)
+```
+
+`.delay()` 不会直接执行函数，而是把任务名称和参数发送到 Broker。
+
+Worker 收到消息后才真正执行：
+
+```python
+execute_workflow_run(run_id)
+```
+
+**为什么聊天执行需要 Worker**
+
+如果直接在 FastAPI 请求中运行 Agent：
+
+- HTTP 连接需要一直保持。
+- 用户关闭页面可能导致请求取消。
+- FastAPI 进程重启后执行状态丢失。
+- 长时间模型调用会占用 API 进程。
+- Human 节点可能需要等待几分钟甚至几小时。
+
+迁移到 Celery 后，HTTP 请求只负责创建 Run。真正的 Workflow 执行不依赖当前 SSE 或 HTTP 连接。
+
+**什么是“跨 Worker 任务恢复”**
+
+这不表示恢复原来的 Python 函数调用位置。
+
+执行到 Human 节点时，Worker 会：
+
+```text
+保存 Workflow context
+保存 next_node_id
+保存 AgentScope state
+Run 状态改为 waiting_human
+结束当前 Celery 任务
+```
+
+用户提交人工输入后：
+
+```text
+Run 状态改为 queued
+→ 再次发送 execute_workflow_run(run_id)
+→ 任意可用 Worker 获取任务
+→ 从数据库读取 checkpoint
+→ 从指定节点继续执行
+```
+
+第二次执行任务的 Worker 可以和第一次不是同一个进程。
+
+因此，真正支持恢复的是数据库中的：
+
+```text
+Run.checkpoint_json
+Run.current_node_id
+Message
+HumanTask
+RunEvent
+```
+
+不是 Worker 内存。
+
+**Worker 如何找到任务函数**
+
+Worker 启动时会导入：
+
+```python
+app.worker.celery_app
+```
+
+其中注册了：
+
+```python
+@celery_app.task(name="workflow.execute_run")
+def execute_workflow_run(run_id: str):
+    ...
+```
+
+Worker 收到名为 `workflow.execute_run` 的消息后，就调用这个函数。
+
+因此修改任务代码后必须重启 Worker，否则 Worker 仍然使用旧版本的 Python 代码。
+
+**Worker 与并发**
+
+可以启动多个 Worker。它们共同消费 Redis 中的任务：
+
+```text
+Redis 中有任务 A、B、C
+Worker 1 执行 A
+Worker 2 执行 B
+Worker 3 执行 C
+```
+
+同一个任务正常情况下只由一个 Worker 获取。
+
+你的项目还使用数据库行锁领取 Run，避免同一个 `run_id` 因重复投递被两个 Worker 同时执行。
+
+**需要注意的边界**
+
+Celery 能负责：
+
+- 排队任务。
+- 分配任务。
+- 在独立进程执行任务。
+- 支持失败和重试配置。
+- 让 API 与执行过程解耦。
+
+Celery本身不能自动恢复：
+
+- Python 协程执行位置。
+- ReActAgent 的 Memory。
+- Workflow 上下文。
+- 已经执行到哪个节点。
+
+这些状态必须由项目主动保存到数据库，然后在下一次 Celery 任务中主动加载。
+
+### runtime下的worker逻辑
+
+不用 Human 节点时，正常情况下，一个 Workflow 会由**一个 Celery 任务从头执行到尾**。
+
+**正常执行流程**
+
+```text
+用户发送消息
+→ FastAPI 创建 Run
+→ 投递 execute_workflow_run(run_id)
+→ Celery Worker 获取任务
+→ 执行 Start、Retrieval、Agent、End
+→ 保存最终回答
+→ Run 变为 success
+→ Celery 任务结束
+```
+
+Celery Worker 内部实际调用：
+
+```python
+execute_workflow_run_sync(run_id)
+```
+
+它通过：
+
+```python
+asyncio.run(_execute_workflow_run(run_id))
+```
+
+启动异步 Workflow 执行。
+
+**Runtime 控制如何同时工作**
+
+Worker 执行 Run 时，会创建两个并行的异步流程：
+
+```text
+WorkflowExecutor：执行 Agent 和工具
+ExecutionControl：监听 interrupt、guidance、continue 命令
+```
+
+它们位于同一个 Celery 任务、同一个事件循环中。
+
+大致结构是：
+
+```python
+control = ExecutionControl(run_id)
+await control.start()
+
+async for event in executor.execute(...):
+    ...
+```
+
+`control.start()` 会启动一个后台异步任务，每隔约 250ms 查询数据库中的 `RunCommand`。
+
+因此 Worker 同时在做：
+
+```text
+主流程：等待模型输出、执行工具
+控制流程：检查用户是否点击停止或发送指导
+```
+
+**点击停止时**
+
+前端调用：
+
+```text
+POST /runs/{run_id}/interrupt
+```
+
+FastAPI 不会直接操作 Worker，只会向数据库写入：
+
+```text
+RunCommand(type="interrupt", status="pending")
+```
+
+Worker 中的 ExecutionControl 查询到命令后：
+
+```text
+标记 stop_requested
+→ 判断当前 phase
+→ 调用 AgentScope agent.interrupt()
+```
+
+如果 Agent 正处于 Thinking 或 Streaming：
+
+```text
+AgentScope 当前 turn 被取消
+→ 返回 _is_interrupted Msg
+→ 转换为 agent_interrupted 事件
+→ 保存 AgentScope state
+→ Run 变成 interrupted
+→ 当前 Celery 任务结束
+```
+
+所以显式停止后，Worker 不会一直占用这个 Run。
+
+**发送 Guidance 时**
+
+如果用户在 Agent 仍然运行时发送：
+
+```text
+改成表格回答
+```
+
+FastAPI 写入：
+
+```text
+RunCommand(type="guidance")
+```
+
+ExecutionControl 读取后：
+
+```text
+中断当前 Agent turn
+→ 等待当前 turn 完整退出
+→ 将指导转换成新的 user Msg
+→ 再次调用同一个 ReActAgent
+```
+
+这时：
+
+- Celery 任务没有结束。
+- ReActAgent 没有重建。
+- Toolkit 没有重建。
+- Memory 没有重建。
+- 只是结束旧 turn，再开启新 turn。
+
+执行关系是：
+
+```text
+同一个 Celery 任务
+  ├─ Agent turn 1：原问题
+  ├─ interrupt
+  └─ Agent turn 2：运行时指导
+```
+
+**工具执行期间收到控制命令**
+
+当 phase 为 `tool` 时，Worker不会调用 `agent.interrupt()`。
+
+处理流程是：
+
+```text
+收到 interrupt 或 guidance
+→ 命令保留
+→ 等待工具执行完成
+→ 获得 tool_result
+→ 再中断或进入新 turn
+```
+
+这样可以避免本地工具或 MCP 工具执行到一半被取消。
+
+**停止后再 Continue**
+
+显式停止后，原 Celery 任务已经结束。
+
+点击“继续执行”时：
+
+```text
+FastAPI 写入 continue 命令
+→ Run 重新变为 queued
+→ 再次投递 execute_workflow_run(run_id)
+→ 某个 Worker 获取任务
+→ 读取 checkpoint
+→ 重建 ReActAgent
+→ 加载 AgentScope state
+→ 继续原任务
+```
+
+这时前后两次可能不是同一个 Worker：
+
+```text
+Celery 任务 1：执行 → 停止 → 保存 checkpoint → 结束
+Celery 任务 2：读取 checkpoint → 恢复 → 继续执行
+```
+
+**SSE 在这个过程中做什么**
+
+SSE 不控制 Worker，只负责展示 Worker 写入的 RunEvent：
+
+```text
+Worker 产生事件
+→ 写入 RunEvent
+→ SSE 接口读取事件
+→ 前端展示
+```
+
+即使用户关闭页面或 SSE 断开：
+
+```text
+Celery Worker 仍然继续执行
+```
+
+因为 Worker 的运行不依赖浏览器连接。
+
+**总结**
+
+没有 Human 节点时有三种情况：
+
+```text
+普通运行：
+一个 Celery 任务从 Start 执行到 End
+```
+
+```text
+运行中 Guidance：
+同一个 Celery 任务中断旧 turn，再执行新 turn
+```
+
+```text
+显式 Stop 后 Continue：
+旧 Celery 任务结束，新 Celery 任务读取 checkpoint 后恢复
+```
+
+Celery负责“在哪个独立进程执行”，数据库 checkpoint 和 AgentScope state 负责“恢复什么执行状态”。
+
