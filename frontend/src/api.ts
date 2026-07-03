@@ -255,6 +255,7 @@ export const api = {
   listWorkflowRuns: (workflowId: string) => request<RunItem[]>(`/workflows/${workflowId}/runs`),
   getRun: (runId: string) => request<RunItem>(`/runs/${runId}`),
   interruptRun: (runId: string) => request(`/runs/${runId}/interrupt`, { method: "POST" }),
+  continueRun: (runId: string) => request(`/runs/${runId}/continue`, { method: "POST" }),
   guideRun: (runId: string, content: string) =>
     request(`/runs/${runId}/guidance`, { method: "POST", body: JSON.stringify({ content }) }),
   respondHumanTask: (taskId: string, action: "submit" | "reject", value?: unknown) =>

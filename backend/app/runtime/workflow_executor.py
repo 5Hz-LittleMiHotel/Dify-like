@@ -56,6 +56,8 @@ class WorkflowExecutor:
         self.checkpoint: dict[str, Any] = {}
         self.paused_human: dict[str, Any] | None = None
         self.interrupted = False
+        self.active_turn_input = ""
+        self.agent_turn_started = False
 
     async def execute(
         self,
@@ -106,6 +108,8 @@ class WorkflowExecutor:
                         "agent_node_id": str(node.get("id") or "agent"),
                         "agent_interrupted": True,
                         "agent_state": self.control.checkpoint_agent() if self.control else None,
+                        "active_turn_input": self.active_turn_input,
+                        "turn_started": self.agent_turn_started,
                     }
                     return
             elif node_type == "human":
@@ -275,19 +279,29 @@ class WorkflowExecutor:
                     ):
                         session.load_state_dict(agent_state)
                     self.control.register_session(session)
-                    if self.control.stop_requested and not self.control.has_guidance():
+                    self.active_turn_input = str(self.checkpoint.get("active_turn_input") or invocation.query)
+                    self.agent_turn_started = bool(self.checkpoint.get("turn_started", False))
+                    if self.control.stop_requested and not self.control.has_resume_input():
                         self.interrupted = True
                         return
                     if self.checkpoint.get("agent_interrupted"):
-                        turn_input = await self.control.wait_for_guidance()
-                        if turn_input is None:
+                        resume_input = await self.control.wait_for_resume_input()
+                        if resume_input is None:
                             self.interrupted = True
                             return
+                        turn_input, active_turn_input = self._resolve_resume_input(
+                            resume_input,
+                            self.active_turn_input,
+                            self.agent_turn_started,
+                        )
                     else:
                         turn_input = invocation.query
+                        active_turn_input = invocation.query
 
                     while turn_input is not None:
-                        next_turn: str | None = None
+                        next_resume_input: tuple[str, str] | None = None
+                        self.active_turn_input = active_turn_input
+                        self.agent_turn_started = True
                         self.control.set_phase("agent")
                         async for event in session.run_turn(turn_input):
                             event_type = event["type"]
@@ -307,19 +321,24 @@ class WorkflowExecutor:
                                     tool_call["output"] = event.get("output")
                             elif event_type == "turn_final":
                                 final_answer = str(event.get("content", ""))
-                                next_turn = self.control.pop_guidance()
-                                if next_turn is None:
+                                next_resume_input = self.control.pop_resume_input()
+                                if next_resume_input is None:
                                     self.result.answer = final_answer
                                     yield {**event, "type": "final"}
                             elif event_type == "agent_interrupted":
-                                next_turn = await self.control.wait_for_guidance()
-                                if next_turn is None:
+                                next_resume_input = await self.control.wait_for_resume_input()
+                                if next_resume_input is None:
                                     self.interrupted = True
                             if event_type != "turn_final":
                                 yield event
-                        if self.interrupted or next_turn is None:
+                        if self.interrupted or next_resume_input is None:
                             break
-                        turn_input = next_turn
+                        turn_input, active_turn_input = self._resolve_resume_input(
+                            next_resume_input,
+                            self.active_turn_input,
+                            self.agent_turn_started,
+                        )
+                        self.agent_turn_started = False
                 except Exception as exc:
                     event = {"type": "adapter_error", "adapter": adapter.name, "message": str(exc)}
                     yield event
@@ -444,6 +463,23 @@ class WorkflowExecutor:
         context["_answer"] = self.result.answer
         context["_tool_calls"] = self.result.tool_calls
         context["_retrieved_chunks"] = self.result.retrieved_chunks
+
+    def _resolve_resume_input(
+        self,
+        resume_input: tuple[str, str],
+        active_turn_input: str,
+        turn_started: bool,
+    ) -> tuple[str, str]:
+        kind, content = resume_input
+        if kind == "guidance":
+            return content, content
+        if not turn_started:
+            return active_turn_input, active_turn_input
+        continuation = (
+            "继续完成刚才被中断的任务。不要询问用户想继续什么，也不要把这句话当成新的业务问题。\n"
+            f"原始任务：{active_turn_input}"
+        )
+        return continuation, active_turn_input
 
     def _normalize_type(self, node_type: str) -> str:
         if node_type in {"agent", "react_agent"}:

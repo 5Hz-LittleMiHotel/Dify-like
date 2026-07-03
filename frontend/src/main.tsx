@@ -676,8 +676,12 @@ function App() {
   const [busy, setBusy] = useState(false);
   const [activeRunId, setActiveRunId] = useState("");
   const [activeRunStatus, setActiveRunStatus] = useState("");
+  const runSubscriptionRef = useRef<{ runId: string; controller: AbortController } | null>(null);
+  const lastRunEventIdRef = useRef(0);
   const [humanInputs, setHumanInputs] = useState<Record<string, string>>({});
   const [statusMessage, setStatusMessage] = useState("");
+
+  useEffect(() => () => runSubscriptionRef.current?.controller.abort(), []);
 
   const selectedOwnedApp = selectedApp?.owner_user_id === user?.id ? selectedApp : null;
   const selectedWorkflowId = selectedWorkflow?.id ?? "";
@@ -754,6 +758,9 @@ function App() {
   }
 
   function resetWorkspace() {
+    runSubscriptionRef.current?.controller.abort();
+    runSubscriptionRef.current = null;
+    lastRunEventIdRef.current = 0;
     setApps([]);
     setWorkflows([]);
     setSelectedApp(null);
@@ -789,6 +796,8 @@ function App() {
     setActiveConversationId(null);
     setSelectedWorkflowNodeId("");
     setBusy(false);
+    setActiveRunId("");
+    setActiveRunStatus("");
   }
 
   function selectRun(run: RunItem | null) {
@@ -796,6 +805,9 @@ function App() {
   }
 
   async function selectWorkflow(workflow: WorkflowItem | null, preloadedMcpServer?: WorkflowMcpServerItem | null) {
+    runSubscriptionRef.current?.controller.abort();
+    runSubscriptionRef.current = null;
+    lastRunEventIdRef.current = 0;
     setSelectedWorkflow(workflow);
     setWorkflowVersions([]);
     setWorkflowMcpServer(null);
@@ -1897,11 +1909,18 @@ function App() {
       { role: "assistant", content: "", timeline: [], status: "streaming" },
     ]);
 
+    const controller = new AbortController();
+    let subscriptionRunId = "";
     try {
-      await streamChat(selectedWorkflow.id, query, conversationIdRef.current, (event, data) => {
+      await streamChat(selectedWorkflow.id, query, conversationIdRef.current, (event, data, eventId) => {
+        if (eventId !== undefined) lastRunEventIdRef.current = eventId;
         if (event === "run_started") {
+          subscriptionRunId = String(data.run_id);
+          const previous = runSubscriptionRef.current;
+          if (previous && previous.runId !== subscriptionRunId) previous.controller.abort();
+          runSubscriptionRef.current = { runId: subscriptionRunId, controller };
           setActiveConversationId(String(data.conversation_id));
-          setActiveRunId(String(data.run_id));
+          setActiveRunId(subscriptionRunId);
           setActiveRunStatus(String(data.status ?? "running"));
           return;
         }
@@ -2104,11 +2123,12 @@ function App() {
             updateLastAssistantMessage(items, (message) => ({ ...message, status: "rejected" })),
           );
         }
-      });
+      }, controller.signal);
       const runList = await api.listWorkflowRuns(selectedWorkflow.id);
       setRuns(runList);
       selectRun(runList[0] ?? null);
     } catch (error) {
+      if (error instanceof DOMException && error.name === "AbortError") return;
       const message = error instanceof Error ? error.message : String(error);
       setNotice(`聊天运行失败：${message}`);
       setMessages((items) =>
@@ -2122,6 +2142,9 @@ function App() {
         })),
       );
     } finally {
+      if (runSubscriptionRef.current?.controller === controller) {
+        runSubscriptionRef.current = null;
+      }
       setBusy(false);
     }
   }
@@ -2136,9 +2159,47 @@ function App() {
     }
   }
 
+  async function continueActiveRun() {
+    if (!activeRunId || activeRunStatus !== "interrupted") return;
+    try {
+      const subscription = runSubscriptionRef.current;
+      if (!subscription || subscription.runId !== activeRunId || subscription.controller.signal.aborted) {
+        const run = await api.getRun(activeRunId);
+        subscribeExistingRun(activeRunId, run.last_event_id);
+      }
+      await api.continueRun(activeRunId);
+      setActiveRunStatus("queued");
+      setBusy(true);
+      setMessages((items) =>
+        updateLastAssistantMessage(items, (message) => ({ ...message, status: "streaming" })),
+      );
+    } catch (error) {
+      setNotice(`继续运行失败：${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+
   function subscribeExistingRun(runId: string, afterId: number) {
-    void streamRunEvents(runId, handleContinuedRunEvent, undefined, afterId).catch((error) => {
+    const existing = runSubscriptionRef.current;
+    if (existing?.runId === runId && !existing.controller.signal.aborted) return;
+    existing?.controller.abort();
+    const controller = new AbortController();
+    runSubscriptionRef.current = { runId, controller };
+    lastRunEventIdRef.current = afterId;
+    void streamRunEvents(
+      runId,
+      (event, data, eventId) => {
+        if (eventId !== undefined) lastRunEventIdRef.current = eventId;
+        handleContinuedRunEvent(event, data);
+      },
+      controller.signal,
+      afterId,
+    ).catch((error) => {
+      if (error instanceof DOMException && error.name === "AbortError") return;
       setNotice(`恢复运行事件失败：${error instanceof Error ? error.message : String(error)}`);
+    }).finally(() => {
+      if (runSubscriptionRef.current?.controller === controller) {
+        runSubscriptionRef.current = null;
+      }
     });
   }
 
@@ -3557,6 +3618,11 @@ function App() {
           {activeRunId && ["queued", "running", "interrupt_requested"].includes(activeRunStatus) ? (
             <button className="secondary-button" type="button" disabled={activeRunStatus === "interrupt_requested"} onClick={stopActiveRun}>
               <Square size={14} /> {activeRunStatus === "interrupt_requested" ? "正在停止" : "停止"}
+            </button>
+          ) : null}
+          {activeRunId && activeRunStatus === "interrupted" ? (
+            <button className="secondary-button" type="button" onClick={continueActiveRun}>
+              <Play size={14} /> 继续执行
             </button>
           ) : null}
           <button

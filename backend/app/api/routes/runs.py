@@ -106,6 +106,23 @@ def guide_run(
     return command
 
 
+@router.post("/runs/{run_id}/continue", response_model=RunCommandOut)
+def continue_run(run_id: str, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    run = get_run_for_user(db, run_id, current_user.id)
+    if not run:
+        raise HTTPException(status_code=404, detail="Run not found")
+    if run.status != "interrupted":
+        raise HTTPException(status_code=409, detail=f"Run cannot continue from status '{run.status}'")
+    command = create_run_command(db, run.id, "continue")
+    append_run_event(db, run.id, "continue_requested", {"run_id": run.id})
+    run.status = "queued"
+    run.phase = "queued"
+    run.ended_at = None
+    db.commit()
+    enqueue_workflow_run(run.id)
+    return command
+
+
 @router.post("/human-tasks/{task_id}/respond", response_model=RunOut)
 def respond_human_task(
     task_id: str,

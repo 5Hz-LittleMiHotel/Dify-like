@@ -15,7 +15,7 @@ class ExecutionControl:
         self.run_id = run_id
         self.phase = "queued"
         self.stop_requested = False
-        self._guidance: deque[str] = deque()
+        self._resume_inputs: deque[tuple[str, str]] = deque()
         self._session: Any = None
         self._monitor_task: asyncio.Task | None = None
         self._interrupt_task: asyncio.Task | None = None
@@ -52,23 +52,23 @@ class ExecutionControl:
                 db.commit()
         self._interrupt_if_needed()
 
-    def has_guidance(self) -> bool:
-        return bool(self._guidance)
+    def has_resume_input(self) -> bool:
+        return bool(self._resume_inputs)
 
-    def pop_guidance(self) -> str | None:
-        if not self._guidance:
+    def pop_resume_input(self) -> tuple[str, str] | None:
+        if not self._resume_inputs:
             return None
         self._interrupt_sent = False
         self.stop_requested = False
-        return self._guidance.popleft()
+        return self._resume_inputs.popleft()
 
-    async def wait_for_guidance(self, timeout: float = 1.0) -> str | None:
+    async def wait_for_resume_input(self, timeout: float = 1.0) -> tuple[str, str] | None:
         deadline = asyncio.get_running_loop().time() + timeout
         while asyncio.get_running_loop().time() < deadline:
             self._consume_commands()
-            guidance = self.pop_guidance()
-            if guidance is not None:
-                return guidance
+            resume_input = self.pop_resume_input()
+            if resume_input is not None:
+                return resume_input
             await asyncio.sleep(0.1)
         return None
 
@@ -102,13 +102,15 @@ class ExecutionControl:
                 elif command.command_type == "guidance":
                     content = str(command.payload_json.get("content") or "").strip()
                     if content:
-                        self._guidance.append(content)
+                        self._resume_inputs.append(("guidance", content))
+                elif command.command_type == "continue":
+                    self._resume_inputs.append(("continue", ""))
                 mark_command_processed(db, command)
 
     def _interrupt_if_needed(self) -> None:
         if self._session is None or self._interrupt_sent:
             return
-        if not (self.stop_requested or self._guidance):
+        if not (self.stop_requested or self._resume_inputs):
             return
         if self.phase not in {"thinking", "streaming", "agent"}:
             return
