@@ -25,11 +25,12 @@ import {
   Save,
   Send,
   Settings2,
+  Square,
   Trash2,
   UserRound,
   Wrench,
 } from "lucide-react";
-import { api, downloadSkill, streamChat } from "./api";
+import { api, downloadSkill, streamChat, streamRunEvents } from "./api";
 import type {
   AppItem,
   ChatMessage,
@@ -204,6 +205,28 @@ function parseChatTimeline(value: unknown): ChatTimelineItem[] {
     ) {
       return [{ id: raw.id, kind: "notice", level: raw.level, message: raw.message }];
     }
+    if (
+      raw.kind === "human"
+      && typeof raw.task_id === "string"
+      && (raw.input_type === "confirm" || raw.input_type === "text" || raw.input_type === "json")
+      && typeof raw.title === "string"
+      && typeof raw.description === "string"
+      && typeof raw.required === "boolean"
+      && (raw.status === "pending" || raw.status === "submitted" || raw.status === "rejected")
+    ) {
+      return [{
+        id: raw.id,
+        kind: "human",
+        task_id: raw.task_id,
+        input_type: raw.input_type,
+        title: raw.title,
+        description: raw.description,
+        required: raw.required,
+        default_value: raw.default_value,
+        status: raw.status,
+        ...(raw.value !== undefined ? { value: raw.value } : {}),
+      }];
+    }
     return [];
   });
 }
@@ -325,6 +348,10 @@ function isAgentNode(node: WorkflowNode) {
   return node.id === "agent" || type === "agent" || type === "react_agent";
 }
 
+function isHumanNode(node: WorkflowNode) {
+  return getWorkflowNodeType(node) === "human";
+}
+
 function getWorkflowNodeLabel(node: WorkflowNode, index: number) {
   const id = getWorkflowNodeId(node, index);
   const type = getWorkflowNodeType(node);
@@ -332,12 +359,14 @@ function getWorkflowNodeLabel(node: WorkflowNode, index: number) {
   if (id === "end" || type === "end") return "结束";
   if (isRetrievalNode(node)) return "检索节点";
   if (isAgentNode(node)) return "Agent 节点";
+  if (isHumanNode(node)) return "人工节点";
   return id;
 }
 
 function getNodeKindClass(node: WorkflowNode) {
   if (isRetrievalNode(node)) return "retrieval";
   if (isAgentNode(node)) return "agent";
+  if (isHumanNode(node)) return "human";
   const type = getWorkflowNodeType(node);
   if (type === "start") return "start";
   if (type === "end") return "end";
@@ -645,6 +674,9 @@ function App() {
   const [selectedWorkflowNodeId, setSelectedWorkflowNodeId] = useState("");
   const [input, setInput] = useState("我的订单10086到哪了？");
   const [busy, setBusy] = useState(false);
+  const [activeRunId, setActiveRunId] = useState("");
+  const [activeRunStatus, setActiveRunStatus] = useState("");
+  const [humanInputs, setHumanInputs] = useState<Record<string, string>>({});
   const [statusMessage, setStatusMessage] = useState("");
 
   const selectedOwnedApp = selectedApp?.owner_user_id === user?.id ? selectedApp : null;
@@ -695,6 +727,7 @@ function App() {
   const selectedWorkflowNodeType = selectedWorkflowNode ? getWorkflowNodeType(selectedWorkflowNode) : "";
   const selectedWorkflowNodeIsAgent = Boolean(selectedWorkflowNode && isAgentNode(selectedWorkflowNode));
   const selectedWorkflowNodeIsRetrieval = Boolean(selectedWorkflowNode && isRetrievalNode(selectedWorkflowNode));
+  const selectedWorkflowNodeIsHuman = Boolean(selectedWorkflowNode && isHumanNode(selectedWorkflowNode));
   const selectedWorkflowNodeKey = selectedWorkflowNode
     ? getWorkflowNodeId(selectedWorkflowNode, Math.max(selectedWorkflowNodeIndex, 0))
     : "";
@@ -792,23 +825,41 @@ function App() {
 
     const latestRun = runList[0] ?? null;
     selectRun(latestRun);
+    const resumableRun = latestRun && ["queued", "running", "interrupt_requested", "waiting_human", "interrupted"].includes(latestRun.status)
+      ? latestRun
+      : null;
+    setActiveRunId(resumableRun?.id ?? "");
+    setActiveRunStatus(resumableRun?.status ?? "");
+    setBusy(Boolean(resumableRun && ["queued", "running", "interrupt_requested"].includes(resumableRun.status)));
     const latestConversationId = latestRun?.conversation_id ?? null;
     setActiveConversationId(latestConversationId);
     if (!latestConversationId) return;
     try {
       const history = await api.listMessages(latestConversationId);
-      setMessages(
-        history
+      let restoredMessages: ChatMessage[] = history
           .filter((message) => message.role === "user" || message.role === "assistant" || message.role === "system")
           .map((message) => ({
             role: message.role,
             content: message.content,
             timeline: message.role === "assistant" ? parseChatTimeline(message.metadata_json.timeline) : [],
             status: message.role === "assistant"
-              ? message.metadata_json.status === "error" ? "error" : "completed"
+              ? ["error", "interrupted", "rejected", "waiting_human", "streaming"].includes(String(message.metadata_json.status))
+                ? String(message.metadata_json.status) as ChatMessage["status"]
+                : "completed"
               : undefined,
-          })),
-      );
+          }));
+      if (resumableRun && ["queued", "running", "interrupt_requested"].includes(resumableRun.status)) {
+        restoredMessages = updateLastAssistantMessage(restoredMessages, (message) => ({
+          ...message,
+          content: "",
+          timeline: [],
+          status: "streaming",
+        }));
+      }
+      setMessages(restoredMessages);
+      if (resumableRun && ["queued", "running", "interrupt_requested"].includes(resumableRun.status)) {
+        subscribeExistingRun(resumableRun.id, 0);
+      }
     } catch (error) {
       console.warn(error);
       setActiveConversationId(null);
@@ -1775,10 +1826,70 @@ function App() {
     }
   }
 
+  function addHumanNodeBeforeEnd() {
+    if (!selectedWorkflow || !canEditSelectedWorkflow) return;
+    const nodes = getWorkflowNodes(selectedWorkflow);
+    const existing = nodes.find((node) => isHumanNode(node));
+    if (existing) {
+      setSelectedWorkflowNodeId(String(existing.id ?? "human"));
+      return;
+    }
+    const endIndex = nodes.findIndex((node) => getWorkflowNodeType(node) === "end");
+    if (endIndex < 0) return;
+    const humanNode = {
+      id: "human",
+      type: "human",
+      input_type: "confirm",
+      title: "请确认后继续",
+      description: "",
+      required: true,
+      default: true,
+      output_key: "human_input",
+    };
+    const nextNodes = [...nodes.slice(0, endIndex), humanNode, ...nodes.slice(endIndex)];
+    const edges = getWorkflowEdges(selectedWorkflow);
+    const incoming = edges.find((edge) => edge.target === getWorkflowNodeId(nodes[endIndex], endIndex));
+    const nextEdges = edges
+      .filter((edge) => edge !== incoming)
+      .map((edge) => [edge.source, edge.target]);
+    if (incoming) nextEdges.push([incoming.source, "human"]);
+    nextEdges.push(["human", getWorkflowNodeId(nodes[endIndex], endIndex)]);
+    setSelectedWorkflow({
+      ...selectedWorkflow,
+      draft_spec: { ...selectedWorkflow.draft_spec, nodes: nextNodes, edges: nextEdges },
+    });
+    setSelectedWorkflowNodeId("human");
+  }
+
+  function updateHumanNode(key: string, value: unknown) {
+    if (!selectedWorkflow || !selectedWorkflowNodeIsHuman) return;
+    const nextNodes = getWorkflowNodes(selectedWorkflow).map((node, index) =>
+      getWorkflowNodeId(node, index) === selectedWorkflowNodeKey ? { ...node, [key]: value } : node,
+    );
+    setSelectedWorkflow({ ...selectedWorkflow, draft_spec: { ...selectedWorkflow.draft_spec, nodes: nextNodes } });
+  }
+
   async function sendMessage() {
-    if (!selectedWorkflow || !selectedWorkflowPublished || !input.trim()) return;
+    if (!input.trim()) return;
     const query = input.trim();
     setInput("");
+    if (activeRunId) {
+      if (activeRunStatus === "waiting_human") return;
+      try {
+        if (activeRunStatus === "interrupted") {
+          const run = await api.getRun(activeRunId);
+          subscribeExistingRun(activeRunId, run.last_event_id);
+        }
+        await api.guideRun(activeRunId, query);
+        setMessages((items) => [...items, { role: "user", content: query }]);
+        setBusy(true);
+        setActiveRunStatus("running");
+      } catch (error) {
+        setNotice(`发送运行时指导失败：${error instanceof Error ? error.message : String(error)}`);
+      }
+      return;
+    }
+    if (!selectedWorkflow || !selectedWorkflowPublished) return;
     setBusy(true);
     setMessages((items) => [
       ...items,
@@ -1790,6 +1901,13 @@ function App() {
       await streamChat(selectedWorkflow.id, query, conversationIdRef.current, (event, data) => {
         if (event === "run_started") {
           setActiveConversationId(String(data.conversation_id));
+          setActiveRunId(String(data.run_id));
+          setActiveRunStatus(String(data.status ?? "running"));
+          return;
+        }
+        if (event === "run_resumed") {
+          setActiveRunStatus("running");
+          setBusy(true);
           return;
         }
         if (event === "retrieval") {
@@ -1890,6 +2008,8 @@ function App() {
           return;
         }
         if (event === "error") {
+          setActiveRunStatus("error");
+          setActiveRunId("");
           setMessages((items) =>
             updateLastAssistantMessage(items, (message) => ({
               ...message,
@@ -1908,12 +2028,80 @@ function App() {
           return;
         }
         if (event === "final") {
+          setActiveRunStatus("success");
+          setActiveRunId("");
           setMessages((items) =>
             updateLastAssistantMessage(items, (message) => ({
               ...message,
               content: String(data.answer ?? message.content),
               status: "completed",
             })),
+          );
+          return;
+        }
+        if (event === "interrupt_requested") {
+          setActiveRunStatus("interrupt_requested");
+          return;
+        }
+        if (event === "interrupted") {
+          setActiveRunStatus("interrupted");
+          setBusy(false);
+          setMessages((items) =>
+            updateLastAssistantMessage(items, (message) => ({ ...message, status: "interrupted" })),
+          );
+          return;
+        }
+        if (event === "human_required") {
+          const taskId = String(data.human_task_id ?? "");
+          setActiveRunStatus("waiting_human");
+          setBusy(false);
+          setMessages((items) =>
+            updateLastAssistantMessage(items, (message) => ({
+              ...message,
+              status: "waiting_human",
+              timeline: [
+                ...(message.timeline ?? []),
+                {
+                  id: `human-${taskId}`,
+                  kind: "human",
+                  task_id: taskId,
+                  input_type: ["confirm", "json"].includes(String(data.input_type))
+                    ? String(data.input_type) as "confirm" | "json"
+                    : "text",
+                  title: String(data.title ?? "需要人工输入"),
+                  description: String(data.description ?? ""),
+                  required: Boolean(data.required),
+                  default_value: data.default,
+                  status: "pending",
+                },
+              ],
+            })),
+          );
+          return;
+        }
+        if (event === "human_submitted") {
+          const taskId = String(data.human_task_id ?? "");
+          setActiveRunStatus("running");
+          setBusy(true);
+          setMessages((items) =>
+            updateLastAssistantMessage(items, (message) => ({
+              ...message,
+              status: "streaming",
+              timeline: (message.timeline ?? []).map((item) =>
+                item.kind === "human" && item.task_id === taskId
+                  ? { ...item, status: "submitted", value: data.value }
+                  : item,
+              ),
+            })),
+          );
+          return;
+        }
+        if (event === "rejected") {
+          setActiveRunStatus("rejected");
+          setActiveRunId("");
+          setBusy(false);
+          setMessages((items) =>
+            updateLastAssistantMessage(items, (message) => ({ ...message, status: "rejected" })),
           );
         }
       });
@@ -1938,6 +2126,178 @@ function App() {
     }
   }
 
+  async function stopActiveRun() {
+    if (!activeRunId) return;
+    try {
+      await api.interruptRun(activeRunId);
+      setActiveRunStatus("interrupt_requested");
+    } catch (error) {
+      setNotice(`停止运行失败：${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+
+  function subscribeExistingRun(runId: string, afterId: number) {
+    void streamRunEvents(runId, handleContinuedRunEvent, undefined, afterId).catch((error) => {
+      setNotice(`恢复运行事件失败：${error instanceof Error ? error.message : String(error)}`);
+    });
+  }
+
+  function handleContinuedRunEvent(event: string, data: Record<string, unknown>) {
+    if (event === "run_resumed") {
+      setActiveRunStatus("running");
+      setBusy(true);
+      return;
+    }
+    if (event === "retrieval") {
+      const chunks = Array.isArray(data.chunks) ? data.chunks.filter(isRecord) : [];
+      setMessages((items) => updateLastAssistantMessage(items, (message) => ({
+        ...message,
+        timeline: [...(message.timeline ?? []), { id: `retrieval-${message.timeline?.length ?? 0}`, kind: "retrieval", chunks }],
+      })));
+      return;
+    }
+    if (event === "thinking_delta" || event === "message_delta") {
+      const messageId = String(data.message_id ?? "");
+      setMessages((items) => updateLastAssistantMessage(items, (message) => {
+        const next = withGenerationPhase(message, messageId);
+        if (event === "message_delta") {
+          return { ...next, content: next.content + String(data.content ?? ""), status: "streaming" };
+        }
+        return {
+          ...next,
+          timeline: (next.timeline ?? []).map((item) => item.kind === "generation" && item.message_id === messageId
+            ? { ...item, thinking: item.thinking + String(data.content ?? "") }
+            : item),
+        };
+      }));
+      return;
+    }
+    if (event === "tool_call") {
+      const messageId = String(data.message_id ?? "");
+      const toolCallId = String(data.tool_call_id ?? "");
+      setMessages((items) => updateLastAssistantMessage(items, (message) => {
+        const next = withGenerationPhase(message, messageId);
+        if ((next.timeline ?? []).some((item) => item.kind === "tool" && item.tool_call_id === toolCallId)) return next;
+        return {
+          ...next,
+          timeline: [...(next.timeline ?? []), {
+            id: `tool-${toolCallId}`,
+            kind: "tool",
+            tool_call_id: toolCallId,
+            name: String(data.name ?? "unknown"),
+            input: isRecord(data.input) ? data.input : {},
+            status: "running",
+          }],
+        };
+      }));
+      return;
+    }
+    if (event === "tool_result") {
+      const toolCallId = String(data.tool_call_id ?? "");
+      setMessages((items) => updateLastAssistantMessage(items, (message) => ({
+        ...message,
+        timeline: (message.timeline ?? []).map((item) => item.kind === "tool" && item.tool_call_id === toolCallId
+          ? { ...item, output: data.output, status: "completed" }
+          : item),
+      })));
+      return;
+    }
+    if (event === "workflow_warning") {
+      setMessages((items) => updateLastAssistantMessage(items, (message) => ({
+        ...message,
+        timeline: [...(message.timeline ?? []), {
+          id: `warning-${message.timeline?.length ?? 0}`,
+          kind: "notice",
+          level: "warning",
+          message: String(data.message ?? "工作流警告"),
+        }],
+      })));
+      return;
+    }
+    if (event === "human_required") {
+      const taskId = String(data.human_task_id ?? "");
+      setActiveRunStatus("waiting_human");
+      setBusy(false);
+      setMessages((items) => updateLastAssistantMessage(items, (message) => ({
+        ...message,
+        status: "waiting_human",
+        timeline: [...(message.timeline ?? []), {
+          id: `human-${taskId}`,
+          kind: "human",
+          task_id: taskId,
+          input_type: ["confirm", "json"].includes(String(data.input_type))
+            ? String(data.input_type) as "confirm" | "json"
+            : "text",
+          title: String(data.title ?? "需要人工输入"),
+          description: String(data.description ?? ""),
+          required: Boolean(data.required),
+          default_value: data.default,
+          status: "pending",
+        }],
+      })));
+      return;
+    }
+    if (event === "human_submitted") {
+      const taskId = String(data.human_task_id ?? "");
+      setMessages((items) => updateLastAssistantMessage(items, (message) => ({
+        ...message,
+        status: "streaming",
+        timeline: (message.timeline ?? []).map((item) => item.kind === "human" && item.task_id === taskId
+          ? { ...item, status: "submitted", value: data.value }
+          : item),
+      })));
+      return;
+    }
+    if (event === "final") {
+      setActiveRunId("");
+      setActiveRunStatus("success");
+      setBusy(false);
+      setMessages((items) => updateLastAssistantMessage(items, (message) => ({
+        ...message,
+        content: String(data.answer ?? message.content),
+        status: "completed",
+      })));
+      return;
+    }
+    if (event === "interrupted") {
+      setActiveRunStatus("interrupted");
+      setBusy(false);
+      setMessages((items) => updateLastAssistantMessage(items, (message) => ({ ...message, status: "interrupted" })));
+      return;
+    }
+    if (event === "error" || event === "rejected") {
+      setActiveRunId("");
+      setActiveRunStatus(event);
+      setBusy(false);
+      setMessages((items) => updateLastAssistantMessage(items, (message) => ({
+        ...message,
+        status: event === "error" ? "error" : "rejected",
+      })));
+    }
+  }
+
+  async function respondToHumanTask(item: Extract<ChatTimelineItem, { kind: "human" }>, action: "submit" | "reject") {
+    try {
+      let value: unknown = humanInputs[item.task_id] ?? item.default_value;
+      if (item.input_type === "confirm") value = true;
+      if (item.input_type === "json" && typeof value === "string") value = JSON.parse(value);
+      if (action === "submit" && activeRunId) {
+        const run = await api.getRun(activeRunId);
+        subscribeExistingRun(activeRunId, run.last_event_id);
+      }
+      await api.respondHumanTask(item.task_id, action, value);
+      if (action === "reject") {
+        setActiveRunId("");
+        setActiveRunStatus("rejected");
+      } else {
+        setActiveRunStatus("running");
+        setBusy(true);
+      }
+    } catch (error) {
+      setNotice(`提交人工输入失败：${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+
   function renderStatusBadge(workflow: WorkflowItem | null, isSelected = false) {
     if (!workflow) return <span className="badge muted">未选择</span>;
     if (isSelected && selectedWorkflowHasUnpublishedChanges) return <span className="badge warning">有未发布改动</span>;
@@ -1948,6 +2308,7 @@ function App() {
   function renderWorkflowNodeIcon(node: WorkflowNode) {
     if (isRetrievalNode(node)) return <Database size={16} />;
     if (isAgentNode(node)) return <Bot size={16} />;
+    if (isHumanNode(node)) return <UserRound size={16} />;
     const type = getWorkflowNodeType(node);
     if (type === "end") return <CheckCircle2 size={16} />;
     return <Play size={16} />;
@@ -1963,6 +2324,7 @@ function App() {
       const toolCount = getAgentNodeTools(node).filter((tool) => tool.enabled).length;
       return `${String(model.model_name ?? selectedOwnedApp?.model_name ?? "继承 App 模型")} · ${toolCount} 个工具`;
     }
+    if (isHumanNode(node)) return `${String(node.input_type ?? "confirm")} · ${String(node.output_key ?? "human_input")}`;
     const type = getWorkflowNodeType(node);
     if (type === "start") return "接收用户输入";
     if (type === "end") return "返回最终答案";
@@ -2541,6 +2903,9 @@ function App() {
           </div>
           <div className="heading-actions">
             {selectedWorkflow ? renderStatusBadge(selectedWorkflow, true) : null}
+            <button className="secondary-button" disabled={busy || !canEditSelectedWorkflow} onClick={addHumanNodeBeforeEnd}>
+              <UserRound size={15} /> 添加人工节点
+            </button>
             <button className="secondary-button" disabled={busy || !canEditSelectedWorkflow || Boolean(draftSpecError)} onClick={saveConfig}>
               <Save size={15} /> 保存草稿
             </button>
@@ -2954,7 +3319,26 @@ function App() {
           ) : null}
           {canEditSelectedWorkflow && selectedWorkflowNodeIsRetrieval ? renderRetrievalNodeSettings() : null}
           {canEditSelectedWorkflow && selectedWorkflowNodeIsAgent ? renderAgentNodeSettings() : null}
-          {canEditSelectedWorkflow && !selectedWorkflowNodeIsRetrieval && !selectedWorkflowNodeIsAgent ? (
+          {canEditSelectedWorkflow && selectedWorkflowNodeIsHuman ? (
+            <div className="form-grid">
+              <label>
+                输入类型
+                <select value={String(selectedWorkflowNode.input_type ?? "confirm")} onChange={(event) => updateHumanNode("input_type", event.target.value)}>
+                  <option value="confirm">确认</option>
+                  <option value="text">文本</option>
+                  <option value="json">JSON</option>
+                </select>
+              </label>
+              <label>标题<input value={String(selectedWorkflowNode.title ?? "")} onChange={(event) => updateHumanNode("title", event.target.value)} /></label>
+              <label>说明<textarea rows={3} value={String(selectedWorkflowNode.description ?? "")} onChange={(event) => updateHumanNode("description", event.target.value)} /></label>
+              <label>输出变量<input value={String(selectedWorkflowNode.output_key ?? "human_input")} onChange={(event) => updateHumanNode("output_key", event.target.value)} /></label>
+              <label className="check-row">
+                <input type="checkbox" checked={Boolean(selectedWorkflowNode.required ?? true)} onChange={(event) => updateHumanNode("required", event.target.checked)} />
+                <span><strong>必填</strong></span>
+              </label>
+            </div>
+          ) : null}
+          {canEditSelectedWorkflow && !selectedWorkflowNodeIsRetrieval && !selectedWorkflowNodeIsAgent && !selectedWorkflowNodeIsHuman ? (
             <div className="readonly-card">
               <strong>{renderWorkflowNodeSummary(selectedWorkflowNode)}</strong>
               <small>该节点当前只展示结构，不提供编辑项。</small>
@@ -3045,6 +3429,39 @@ function App() {
       );
     }
 
+    if (item.kind === "human") {
+      const defaultText = item.default_value == null
+        ? ""
+        : item.input_type === "json"
+          ? JSON.stringify(item.default_value, null, 2)
+          : String(item.default_value);
+      const value = humanInputs[item.task_id] ?? defaultText;
+      return (
+        <div className="timeline-row human" key={item.id}>
+          <span className="timeline-marker"><UserRound size={15} /></span>
+          <div className="timeline-content human-task">
+            <strong>{item.title}</strong>
+            {item.description ? <span>{item.description}</span> : null}
+            {item.status === "pending" ? (
+              <>
+                {item.input_type !== "confirm" ? (
+                  <textarea
+                    value={value}
+                    placeholder={item.input_type === "json" ? "输入 JSON" : "输入内容"}
+                    onChange={(event) => setHumanInputs((items) => ({ ...items, [item.task_id]: event.target.value }))}
+                  />
+                ) : null}
+                <div className="human-actions">
+                  <button className="primary-button" type="button" onClick={() => respondToHumanTask(item, "submit")}>确认并继续</button>
+                  <button className="ghost-danger-button" type="button" onClick={() => respondToHumanTask(item, "reject")}>拒绝并终止</button>
+                </div>
+              </>
+            ) : <span>{item.status === "submitted" ? "已提交" : "已拒绝"}</span>}
+          </div>
+        </div>
+      );
+    }
+
     return (
       <div className={`timeline-row notice ${item.level}`} key={item.id} role={item.level === "error" ? "alert" : undefined}>
         <span className="timeline-marker"><Circle size={13} /></span>
@@ -3059,7 +3476,17 @@ function App() {
   function renderChatMessage(message: ChatMessage) {
     if (message.role !== "assistant") return message.content;
     const timeline = message.timeline ?? [];
-    const answerLabel = message.status === "completed" ? "最终回答" : message.status === "error" ? "回答中断" : "回答生成中";
+    const answerLabel = message.status === "completed"
+      ? "最终回答"
+      : message.status === "error"
+        ? "回答失败"
+        : message.status === "interrupted"
+          ? "已停止"
+          : message.status === "rejected"
+            ? "已拒绝"
+          : message.status === "waiting_human"
+            ? "等待人工输入"
+            : "回答生成中";
     return (
       <>
         {timeline.length ? <div className="message-timeline">{timeline.map(renderTimelineItem)}</div> : null}
@@ -3127,8 +3554,22 @@ function App() {
               if (event.key === "Enter") sendMessage();
             }}
           />
-          <button className="primary-button" disabled={busy || !selectedWorkflowPublished || !input.trim()} onClick={sendMessage}>
-            {busy ? <Loader2 className="spin" size={15} /> : <Send size={15} />} 发送
+          {activeRunId && ["queued", "running", "interrupt_requested"].includes(activeRunStatus) ? (
+            <button className="secondary-button" type="button" disabled={activeRunStatus === "interrupt_requested"} onClick={stopActiveRun}>
+              <Square size={14} /> {activeRunStatus === "interrupt_requested" ? "正在停止" : "停止"}
+            </button>
+          ) : null}
+          <button
+            className="primary-button"
+            disabled={
+              !input.trim()
+              || activeRunStatus === "waiting_human"
+              || (!activeRunId && (busy || !selectedWorkflowPublished))
+            }
+            onClick={sendMessage}
+          >
+            {busy && !activeRunId ? <Loader2 className="spin" size={15} /> : <Send size={15} />}
+            {activeRunId ? "发送指导" : "发送"}
           </button>
         </div>
       </section>

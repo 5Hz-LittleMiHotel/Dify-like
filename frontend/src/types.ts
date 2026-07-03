@@ -155,9 +155,31 @@ export type RunItem = {
   workflow_version_id: string;
   conversation_id: string;
   status: string;
+  phase: string;
+  current_node_id: string;
   latency_ms: number;
   error: string;
   created_at: string;
+  updated_at: string;
+  ended_at: string | null;
+  last_event_id: number;
+  human_task?: HumanTaskItem | null;
+};
+
+export type HumanTaskItem = {
+  id: string;
+  run_id: string;
+  node_id: string;
+  input_type: "confirm" | "text" | "json";
+  title: string;
+  description: string;
+  required: boolean;
+  default_json: unknown;
+  output_key: string;
+  status: string;
+  response_json: unknown;
+  created_at: string;
+  responded_at: string | null;
 };
 
 export type MessageItem = {
@@ -173,7 +195,7 @@ export type ChatMessage = {
   role: "user" | "assistant" | "system";
   content: string;
   timeline?: ChatTimelineItem[];
-  status?: "streaming" | "completed" | "error";
+  status?: "streaming" | "waiting_human" | "interrupted" | "rejected" | "completed" | "error";
 };
 
 export type ChatTimelineItem =
@@ -203,6 +225,18 @@ export type ChatTimelineItem =
       kind: "notice";
       level: "warning" | "error";
       message: string;
+    }
+  | {
+      id: string;
+      kind: "human";
+      task_id: string;
+      input_type: "confirm" | "text" | "json";
+      title: string;
+      description: string;
+      required: boolean;
+      default_value: unknown;
+      status: "pending" | "submitted" | "rejected";
+      value?: unknown;
     };
 
 export type PlatformSkillItem = {

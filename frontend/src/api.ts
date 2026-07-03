@@ -253,6 +253,15 @@ export const api = {
       method: "DELETE",
     }),
   listWorkflowRuns: (workflowId: string) => request<RunItem[]>(`/workflows/${workflowId}/runs`),
+  getRun: (runId: string) => request<RunItem>(`/runs/${runId}`),
+  interruptRun: (runId: string) => request(`/runs/${runId}/interrupt`, { method: "POST" }),
+  guideRun: (runId: string, content: string) =>
+    request(`/runs/${runId}/guidance`, { method: "POST", body: JSON.stringify({ content }) }),
+  respondHumanTask: (taskId: string, action: "submit" | "reject", value?: unknown) =>
+    request<RunItem>(`/human-tasks/${taskId}/respond`, {
+      method: "POST",
+      body: JSON.stringify({ action, value }),
+    }),
   listMessages: (conversationId: string) => request<MessageItem[]>(`/conversations/${conversationId}/messages`),
   listSkills: () => request<PlatformSkillItem[]>("/skills"),
   listPlatformSkills: () => request<PlatformSkillItem[]>("/skills/platform"),
@@ -305,7 +314,8 @@ export async function streamChat(
   workflowId: string,
   query: string,
   conversationId: string | null,
-  onEvent: (event: string, data: Record<string, unknown>) => void,
+  onEvent: (event: string, data: Record<string, unknown>, eventId?: number) => void,
+  signal?: AbortSignal,
 ) {
   const headers = getRequestHeaders();
   const response = await fetch(`${API_BASE}/workflows/${workflowId}/chat`, {
@@ -315,12 +325,33 @@ export async function streamChat(
       "Content-Type": "application/json",
     },
     body: JSON.stringify({ query, conversation_id: conversationId, stream: true }),
+    signal,
   });
-  if (!response.ok || !response.body) {
+  if (!response.ok) {
     throw new Error(await readErrorMessage(response));
   }
 
-  const reader = response.body.getReader();
+  const started = (await response.json()) as { conversation_id: string; run_id: string; status: string };
+  onEvent("run_started", started);
+  await streamRunEvents(started.run_id, onEvent, signal);
+  return started;
+}
+
+export async function streamRunEvents(
+  runId: string,
+  onEvent: (event: string, data: Record<string, unknown>, eventId?: number) => void,
+  signal?: AbortSignal,
+  afterId = 0,
+) {
+  const eventResponse = await fetch(`${API_BASE}/runs/${runId}/events?after_id=${afterId}`, {
+    headers: getRequestHeaders(),
+    signal,
+  });
+  if (!eventResponse.ok || !eventResponse.body) {
+    throw new Error(await readErrorMessage(eventResponse));
+  }
+
+  const reader = eventResponse.body.getReader();
   const decoder = new TextDecoder("utf-8");
   let buffer = "";
 
@@ -334,8 +365,10 @@ export async function streamChat(
     for (const part of parts) {
       const eventLine = part.split("\n").find((line) => line.startsWith("event: "));
       const dataLine = part.split("\n").find((line) => line.startsWith("data: "));
+      const idLine = part.split("\n").find((line) => line.startsWith("id: "));
       if (!eventLine || !dataLine) continue;
-      onEvent(eventLine.slice(7), JSON.parse(dataLine.slice(6)));
+      const eventId = idLine && /^\d+$/.test(idLine.slice(4)) ? Number(idLine.slice(4)) : undefined;
+      onEvent(eventLine.slice(7), JSON.parse(dataLine.slice(6)), eventId);
     }
   }
 }

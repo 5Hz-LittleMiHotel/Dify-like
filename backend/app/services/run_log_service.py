@@ -22,7 +22,8 @@ def create_run(
         workflow_version_id=workflow_version_id,
         conversation_id=conversation_id,
         input_message_id=input_message_id,
-        status="running",
+        status="queued",
+        phase="queued",
     )
     db.add(run)
     db.commit()
@@ -68,6 +69,8 @@ def finish_run(
     run.output_message_id = output_message_id
     run.error = error
     run.latency_ms = int((perf_counter() - started_at) * 1000)
+    run.phase = status
+    run.ended_at = datetime.now(timezone.utc)
     db.commit()
     db.refresh(run)
     return run

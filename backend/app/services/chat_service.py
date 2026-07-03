@@ -78,6 +78,20 @@ def _record_timeline_event(timeline: list[dict[str, Any]], event: dict[str, Any]
                 "message": str(event.get("message") or "工作流警告"),
             }
         )
+    elif event_type == "human_required":
+        timeline.append(
+            {
+                "id": f"human-{event.get('human_task_id') or event.get('node_id') or len(timeline)}",
+                "kind": "human",
+                "task_id": str(event.get("human_task_id") or ""),
+                "input_type": str(event.get("input_type") or "confirm"),
+                "title": str(event.get("title") or "需要人工输入"),
+                "description": str(event.get("description") or ""),
+                "required": bool(event.get("required", True)),
+                "default_value": event.get("default"),
+                "status": "pending",
+            }
+        )
 
 
 def _append_error(timeline: list[dict[str, Any]], message: str) -> None:
@@ -142,6 +156,46 @@ def add_message(db: Session, conversation_id: str, role: str, content: str, meta
     db.commit()
     db.refresh(message)
     return message
+
+
+def create_chat_execution(
+    db: Session,
+    app: App,
+    workflow: Workflow,
+    workflow_version: WorkflowVersion,
+    query: str,
+    user_id: str,
+    conversation_id: str | None = None,
+) -> dict[str, str]:
+    from app.services.execution_event_service import append_run_event
+    from app.services.execution_runtime_service import enqueue_workflow_run
+
+    conversation = get_or_create_conversation(db, app.id, workflow.id, user_id, conversation_id)
+    user_message = add_message(db, conversation.id, "user", query)
+    run = create_run(db, app.id, workflow.id, workflow_version.id, conversation.id, user_message.id)
+    output_message = add_message(
+        db,
+        conversation.id,
+        "assistant",
+        "",
+        {"status": "queued", "timeline": [], "tool_calls": [], "retrieved_chunks": []},
+    )
+    run.output_message_id = output_message.id
+    db.commit()
+    append_run_event(
+        db,
+        run.id,
+        "run_started",
+        {
+            "conversation_id": conversation.id,
+            "run_id": run.id,
+            "workflow_id": workflow.id,
+            "workflow_version_id": workflow_version.id,
+            "status": "queued",
+        },
+    )
+    enqueue_workflow_run(run.id)
+    return {"conversation_id": conversation.id, "run_id": run.id, "status": run.status}
 
 
 async def chat_once(

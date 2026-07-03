@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+import json
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from typing import Any
@@ -9,6 +11,8 @@ from opentelemetry.trace import SpanKind
 from opentelemetry.trace.propagation.tracecontext import TraceContextTextMapPropagator
 from sqlalchemy.orm import Session
 
+from app.core.config import get_settings
+from app.db.models import HumanTask, Message, Run
 from app.mcp.protocol import (
     JSONRPC_INTERNAL_ERROR,
     JSONRPC_INVALID_PARAMS,
@@ -21,7 +25,8 @@ from app.mcp.protocol import (
     build_jsonrpc_result,
     parse_jsonrpc_request,
 )
-from app.services.chat_service import chat_once
+from app.services.chat_service import create_chat_execution
+from app.services.execution_event_service import get_pending_human_task
 from app.services.workflow_mcp_server_service import (
     get_public_workflow_mcp_server_by_slug,
     verify_workflow_mcp_server_token,
@@ -29,6 +34,7 @@ from app.services.workflow_mcp_server_service import (
 
 
 RUN_WORKFLOW_TOOL_NAME = "run_workflow"
+GET_WORKFLOW_RUN_TOOL_NAME = "get_workflow_run"
 
 
 async def handle_workflow_mcp_request(
@@ -85,7 +91,16 @@ async def handle_workflow_mcp_request(
                                     },
                                     "required": ["query"],
                                 },
-                            }
+                            },
+                            {
+                                "name": GET_WORKFLOW_RUN_TOOL_NAME,
+                                "description": "Get the current status or final result of a workflow run.",
+                                "inputSchema": {
+                                    "type": "object",
+                                    "properties": {"run_id": {"type": "string"}},
+                                    "required": ["run_id"],
+                                },
+                            },
                         ]
                     },
                 )
@@ -133,10 +148,17 @@ async def _handle_tools_call(
 ) -> dict[str, Any]:
     tool_name = str(params.get("name") or "").strip()
     arguments = params.get("arguments", {})
-    if tool_name != RUN_WORKFLOW_TOOL_NAME:
+    if tool_name not in {RUN_WORKFLOW_TOOL_NAME, GET_WORKFLOW_RUN_TOOL_NAME}:
         raise JsonRpcError(JSONRPC_INVALID_PARAMS, f"Unsupported tool name: {tool_name or 'empty'}")
     if not isinstance(arguments, dict):
         raise JsonRpcError(JSONRPC_INVALID_PARAMS, "tools/call arguments must be an object.")
+
+    mcp_user_id = f"mcp:{server_slug}"
+    if tool_name == GET_WORKFLOW_RUN_TOOL_NAME:
+        run_id = str(arguments.get("run_id") or "").strip()
+        if not run_id:
+            raise JsonRpcError(JSONRPC_INVALID_PARAMS, "get_workflow_run requires run_id.")
+        return _workflow_run_result(db, request_id, run_id, workflow.id, mcp_user_id)
 
     query = str(arguments.get("query") or "").strip()
     if not query:
@@ -147,39 +169,66 @@ async def _handle_tools_call(
         raise JsonRpcError(MCP_WORKFLOW_NOT_PUBLISHED, "Workflow is not published.")
 
     conversation_id = str(arguments.get("conversation_id") or "").strip() or None
-    mcp_user_id = f"mcp:{server_slug}"
-    try:
-        result = await chat_once(
-            db,
-            app,
-            workflow,
-            published_version,
-            query,
-            mcp_user_id,
-            conversation_id,
-        )
-    except ValueError as exc:
-        raise JsonRpcError(MCP_TOOL_EXECUTION_ERROR, str(exc)) from exc
+    result = create_chat_execution(
+        db,
+        app,
+        workflow,
+        published_version,
+        query,
+        mcp_user_id,
+        conversation_id,
+    )
+    run_id = result["run_id"]
+    deadline = asyncio.get_running_loop().time() + get_settings().mcp_tool_timeout_seconds
+    while asyncio.get_running_loop().time() < deadline:
+        db.expire_all()
+        run = db.get(Run, run_id)
+        if run and run.status in {"waiting_human", "interrupted", "success", "rejected", "error"}:
+            break
+        await asyncio.sleep(0.25)
+    return _workflow_run_result(db, request_id, run_id, workflow.id, mcp_user_id)
 
+
+def _workflow_run_result(
+    db: Session,
+    request_id: Any,
+    run_id: str,
+    workflow_id: str,
+    mcp_user_id: str,
+) -> dict[str, Any]:
+    from app.db.models import Conversation
+
+    run = db.get(Run, run_id)
+    conversation = db.get(Conversation, run.conversation_id) if run else None
+    if not run or run.workflow_id != workflow_id or not conversation or conversation.user_id != mcp_user_id:
+        raise JsonRpcError(JSONRPC_INVALID_PARAMS, "Workflow run not found.")
+    output = db.get(Message, run.output_message_id) if run.output_message_id else None
+    human_task: HumanTask | None = get_pending_human_task(db, run.id)
+    metadata = output.metadata_json if output and isinstance(output.metadata_json, dict) else {}
     structured = {
-        "answer": result["answer"],
-        "conversation_id": result["conversation_id"],
-        "run_id": result["run_id"],
-        "workflow_id": workflow.id,
-        "workflow_version_id": published_version.id,
-        "tool_calls": result["tool_calls"],
-        "retrieved_chunks": result["retrieved_chunks"],
+        "status": run.status,
+        "phase": run.phase,
+        "answer": output.content if output else "",
+        "conversation_id": run.conversation_id,
+        "run_id": run.id,
+        "workflow_id": run.workflow_id,
+        "workflow_version_id": run.workflow_version_id,
+        "tool_calls": metadata.get("tool_calls", []),
+        "retrieved_chunks": metadata.get("retrieved_chunks", []),
+        "human_task_id": human_task.id if human_task else None,
+        "error": run.error,
     }
+    text = structured["answer"] if run.status == "success" else json.dumps(structured, ensure_ascii=False)
     return build_jsonrpc_result(
         request_id,
         {
             "content": [
                 {
                     "type": "text",
-                    "text": structured["answer"],
+                    "text": text,
                 }
             ],
             "structuredContent": structured,
-            "isError": False,
+            "isError": run.status == "error",
         },
     )

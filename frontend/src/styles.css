@@ -1428,6 +1428,26 @@ pre {
   background: var(--danger-soft);
 }
 
+.human-task textarea {
+  width: 100%;
+  min-height: 88px;
+  resize: vertical;
+  margin-top: 8px;
+  padding: 9px 10px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--surface);
+  color: var(--text);
+  font: inherit;
+}
+
+.human-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 8px;
+}
+
 .assistant-answer {
   display: grid;
   gap: 5px;

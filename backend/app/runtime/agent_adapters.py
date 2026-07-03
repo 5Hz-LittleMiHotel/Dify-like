@@ -36,6 +36,100 @@ class BaseAgentAdapter:
         raise NotImplementedError
 
 
+class AgentScopeSession:
+    def __init__(self, adapter: "AgentScopeAdapter", agent: Any):
+        self.adapter = adapter
+        self.agent = agent
+
+    def interrupt(self) -> None:
+        self.agent.interrupt()
+
+    def state_dict(self) -> dict[str, Any]:
+        return self.agent.state_dict()
+
+    def load_state_dict(self, state: dict[str, Any]) -> None:
+        self.agent.load_state_dict(state)
+
+    async def run_turn(self, content: str) -> AsyncIterator[RuntimeEvent]:
+        from agentscope.message import Msg
+        from agentscope.pipeline import stream_printing_messages
+
+        task = self.agent(Msg("user", content, "user"))
+        latest_text = ""
+        message_texts: dict[str, str] = {}
+        message_thinking: dict[str, str] = {}
+        emitted_tool_calls: set[str] = set()
+        emitted_tool_results: set[str] = set()
+        interrupted = False
+
+        async for msg, last in stream_printing_messages(agents=[self.agent], coroutine_task=task):
+            message_id = str(getattr(msg, "id", "") or id(msg))
+            metadata = getattr(msg, "metadata", None)
+            is_interrupted_msg = isinstance(metadata, dict) and bool(metadata.get("_is_interrupted"))
+            if is_interrupted_msg:
+                interrupted = True
+
+            if str(getattr(msg, "role", "")) == "assistant" and not is_interrupted_msg:
+                current_thinking = self.adapter._extract_thinking(msg)
+                previous_thinking = message_thinking.get(message_id, "")
+                thinking_delta = (
+                    current_thinking[len(previous_thinking) :]
+                    if current_thinking.startswith(previous_thinking)
+                    else current_thinking
+                )
+                message_thinking[message_id] = current_thinking
+                if thinking_delta:
+                    yield {
+                        "type": "thinking_delta",
+                        "message_id": message_id,
+                        "content": thinking_delta,
+                        "source": "agentscope",
+                    }
+
+                current = self.adapter._extract_text(msg)
+                previous = message_texts.get(message_id, "")
+                if current:
+                    latest_text = current
+                delta = current[len(previous) :] if current.startswith(previous) else current
+                message_texts[message_id] = current
+                if delta:
+                    yield {
+                        "type": "message_delta",
+                        "message_id": message_id,
+                        "content": delta,
+                        "source": "agentscope",
+                    }
+
+            if last:
+                for block in self.adapter._content_blocks(msg):
+                    block_type = str(block.get("type") or "")
+                    tool_call_id = str(block.get("id") or "")
+                    if block_type == "tool_use" and tool_call_id and tool_call_id not in emitted_tool_calls:
+                        emitted_tool_calls.add(tool_call_id)
+                        yield {
+                            "type": "tool_call",
+                            "message_id": message_id,
+                            "tool_call_id": tool_call_id,
+                            "name": str(block.get("name") or ""),
+                            "input": block.get("input") if isinstance(block.get("input"), dict) else {},
+                            "source": "agentscope",
+                        }
+                    elif block_type == "tool_result" and tool_call_id and tool_call_id not in emitted_tool_results:
+                        emitted_tool_results.add(tool_call_id)
+                        yield {
+                            "type": "tool_result",
+                            "tool_call_id": tool_call_id,
+                            "name": str(block.get("name") or ""),
+                            "output": self.adapter._normalize_tool_output(block.get("output")),
+                            "source": "agentscope",
+                        }
+
+        if interrupted:
+            yield {"type": "agent_interrupted", "source": "agentscope"}
+        else:
+            yield {"type": "turn_final", "content": latest_text, "source": "agentscope"}
+
+
 def build_agent_context(invocation: AgentInvocation) -> tuple[str, dict[str, Any]]:
     if not invocation.retrieved_chunks:
         return "", {"used_chunk_ids": [], "dropped_chunk_ids": [], "available_tokens": 0}
@@ -176,13 +270,8 @@ class AgentScopeAdapter(BaseAgentAdapter):
     name = "agentscope"
 
     async def run(self, invocation: AgentInvocation) -> AsyncIterator[RuntimeEvent]:
-        # 函数作用：把项目内部的 AgentInvocation 转成 AgentScope 调用，再把 AgentScope 的输出转回项目统一的 RuntimeEvent。
         try:
-            # 1.创建 AgentScope agent。
-            agent = await self._create_agent(invocation)
-            # 2.导入 AgentScope 的消息和流式工具:
-            from agentscope.message import Msg  # Msg 用来把用户输入包装成 AgentScope 能识别的消息
-            from agentscope.pipeline import stream_printing_messages  # stream_printing_messages 用来接收 AgentScope 运行中的流式输出
+            session = await self.create_session(invocation)
         except ImportError as exc:
             yield {
                 "type": "adapter_error",
@@ -200,81 +289,12 @@ class AgentScopeAdapter(BaseAgentAdapter):
                 "message": str(exc),
             }
             return
-
-        # 3.关闭 AgentScope 自己往控制台打印；不同版本可能没有这个方法，所以这里做一层兼容。
-        set_console_output_enabled = getattr(agent, "set_console_output_enabled", None)
-        if callable(set_console_output_enabled):
-            set_console_output_enabled(False)
-
-        # 4.把用户输入包装成一条 user 消息，启动 AgentScope 的 ReActAgent 执行。
-        # task 会被交给 stream_printing_messages() 去流式消费。
-        task = agent(Msg("user", invocation.query, "user"))
-        latest_text = ""
-        message_texts: dict[str, str] = {}
-        message_thinking: dict[str, str] = {}
-        emitted_tool_calls: set[str] = set()
-        emitted_tool_results: set[str] = set()
-
         try:
-            # 5.把 AgentScope 输出(Msg 流)转换成项目事件(RuntimeEvent 流)，这是 adapter 的核心：
-            # AgentScope 给出的通常是“当前完整文本”，而前端需要的是“增量文本”。
-            # 所以代码按消息 ID 记录上一次文本，然后算出这次新增的部分 delta。
-            async for msg, last in stream_printing_messages(agents=[agent], coroutine_task=task):
-                message_id = str(getattr(msg, "id", "") or id(msg))
-                if str(getattr(msg, "role", "")) == "assistant":
-                    current_thinking = self._extract_thinking(msg)
-                    previous_thinking = message_thinking.get(message_id, "")
-                    thinking_delta = (
-                        current_thinking[len(previous_thinking) :]
-                        if current_thinking.startswith(previous_thinking)
-                        else current_thinking
-                    )
-                    message_thinking[message_id] = current_thinking
-                    if thinking_delta:
-                        yield {
-                            "type": "thinking_delta",
-                            "message_id": message_id,
-                            "content": thinking_delta,
-                            "source": "agentscope",
-                        }
-
-                    current = self._extract_text(msg)
-                    previous = message_texts.get(message_id, "")
-                    if current:
-                        latest_text = current
-                    delta = current[len(previous) :] if current.startswith(previous) else current
-                    message_texts[message_id] = current
-                    if delta:
-                        yield {
-                            "type": "message_delta",
-                            "message_id": message_id,
-                            "content": delta,
-                            "source": "agentscope",
-                        }
-
-                if last:
-                    for block in self._content_blocks(msg):
-                        block_type = str(block.get("type") or "")
-                        tool_call_id = str(block.get("id") or "")
-                        if block_type == "tool_use" and tool_call_id and tool_call_id not in emitted_tool_calls:
-                            emitted_tool_calls.add(tool_call_id)
-                            yield {
-                                "type": "tool_call",
-                                "message_id": message_id,
-                                "tool_call_id": tool_call_id,
-                                "name": str(block.get("name") or ""),
-                                "input": block.get("input") if isinstance(block.get("input"), dict) else {},
-                                "source": "agentscope",
-                            }
-                        elif block_type == "tool_result" and tool_call_id and tool_call_id not in emitted_tool_results:
-                            emitted_tool_results.add(tool_call_id)
-                            yield {
-                                "type": "tool_result",
-                                "tool_call_id": tool_call_id,
-                                "name": str(block.get("name") or ""),
-                                "output": self._normalize_tool_output(block.get("output")),
-                                "source": "agentscope",
-                            }
+            async for event in session.run_turn(invocation.query):
+                if event["type"] == "turn_final":
+                    yield {**event, "type": "final"}
+                else:
+                    yield event
         except Exception as exc:
             yield {
                 "type": "adapter_error",
@@ -282,13 +302,13 @@ class AgentScopeAdapter(BaseAgentAdapter):
                 "message": str(exc),
             }
             return
-        # 6.只有当 stream_printing_messages 整体结束后，才说明 agent 本轮执行真正完成。
-        # 这里统一发一次 final，避免 ReAct 工具调用过程中提前出现空 final。
-        yield {
-            "type": "final",
-            "content": latest_text,
-            "source": "agentscope",
-        }
+
+    async def create_session(self, invocation: AgentInvocation) -> AgentScopeSession:
+        agent = await self._create_agent(invocation)
+        set_console_output_enabled = getattr(agent, "set_console_output_enabled", None)
+        if callable(set_console_output_enabled):
+            set_console_output_enabled(False)
+        return AgentScopeSession(self, agent)
 
     async def _create_agent(self, invocation: AgentInvocation):
         """

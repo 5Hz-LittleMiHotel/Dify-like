@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 from datetime import datetime
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
@@ -282,6 +282,12 @@ class ChatResponse(BaseModel):
     retrieved_chunks: list[dict[str, Any]]
 
 
+class ChatRunOut(BaseModel):
+    conversation_id: str
+    run_id: str
+    status: str
+
+
 class KnowledgeBaseCreate(BaseModel):
     name: str = Field(min_length=1, max_length=120)
     description: str = ""
@@ -332,6 +338,43 @@ class KnowledgeDocumentOut(BaseModel):
     model_config = {"from_attributes": True}
 
 
+class HumanTaskOut(BaseModel):
+    id: str
+    run_id: str
+    node_id: str
+    input_type: str
+    title: str
+    description: str
+    required: bool
+    default_json: Any = None
+    output_key: str
+    status: str
+    response_json: Any = None
+    created_at: datetime
+    responded_at: datetime | None
+
+    model_config = {"from_attributes": True}
+
+
+class HumanTaskRespond(BaseModel):
+    action: Literal["submit", "reject"]
+    value: Any = None
+
+
+class GuidanceRequest(BaseModel):
+    content: str = Field(min_length=1)
+
+
+class RunCommandOut(BaseModel):
+    id: int
+    run_id: str
+    command_type: str
+    status: str
+    created_at: datetime
+
+    model_config = {"from_attributes": True}
+
+
 class RunOut(BaseModel):
     id: str
     app_id: str
@@ -339,9 +382,15 @@ class RunOut(BaseModel):
     workflow_version_id: str
     conversation_id: str
     status: str
+    phase: str
+    current_node_id: str
     latency_ms: int
     error: str
     created_at: datetime
+    updated_at: datetime
+    ended_at: datetime | None
+    last_event_id: int = 0
+    human_task: HumanTaskOut | None = None
 
     model_config = {"from_attributes": True}
 

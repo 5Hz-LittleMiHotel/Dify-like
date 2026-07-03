@@ -1,14 +1,12 @@
 from fastapi import APIRouter, Depends, HTTPException
-from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 
 from app.api.dependencies import get_current_user
 from app.db.models import User
 from app.db.session import get_db
-from app.schemas import ChatRequest, ChatResponse
+from app.schemas import ChatRequest, ChatRunOut
 from app.services.chat_service import (
-    chat_once,
-    chat_stream,
+    create_chat_execution,
     get_conversation_for_user,
     list_messages,
 )
@@ -17,8 +15,8 @@ from app.services.workflow_service import get_published_workflow_for_chat
 router = APIRouter(tags=["chat"])
 
 
-@router.post("/workflows/{workflow_id}/chat", response_model=ChatResponse | None)
-async def chat(
+@router.post("/workflows/{workflow_id}/chat", response_model=ChatRunOut)
+def chat(
     workflow_id: str,
     payload: ChatRequest,
     db: Session = Depends(get_db),
@@ -28,15 +26,15 @@ async def chat(
     if not resolved:
         raise HTTPException(status_code=400, detail="Workflow is not published")
     workflow, app, workflow_version = resolved
-    if payload.stream:
-        return StreamingResponse(
-            chat_stream(db, app, workflow, workflow_version, payload.query, current_user.id, payload.conversation_id),
-            media_type="text/event-stream",
-        )
-    try:
-        return await chat_once(db, app, workflow, workflow_version, payload.query, current_user.id, payload.conversation_id)
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return create_chat_execution(
+        db,
+        app,
+        workflow,
+        workflow_version,
+        payload.query,
+        current_user.id,
+        payload.conversation_id,
+    )
 
 
 @router.get("/conversations/{conversation_id}/messages")

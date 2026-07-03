@@ -8,7 +8,8 @@ from typing import Any
 from sqlalchemy.orm import Session
 
 from app.core.config import activate_agentscope_tracing_context, get_settings
-from app.runtime.agent_adapters import AgentInvocation, RuntimeEvent, build_agent_adapter
+from app.runtime.agent_adapters import AgentInvocation, AgentScopeAdapter, RuntimeEvent, build_agent_adapter
+from app.runtime.execution_control import ExecutionControl
 from app.services.agent_tool_spec import resolve_agent_enabled_builtin_tool_names
 from app.services.external_mcp_server_service import resolve_agent_mcp_tool_runtime_specs
 from app.services.model_credential_service import resolve_model_api_key
@@ -36,13 +37,25 @@ class WorkflowResult:
 
 
 class WorkflowExecutor:
-    def __init__(self, db: Session, app: Any, workflow_spec: dict[str, Any], run_id: str, workflow_id: str = ""):
+    def __init__(
+        self,
+        db: Session,
+        app: Any,
+        workflow_spec: dict[str, Any],
+        run_id: str,
+        workflow_id: str = "",
+        control: ExecutionControl | None = None,
+    ):
         self.db = db
         self.app = app
         self.workflow_spec = workflow_spec
         self.run_id = run_id
         self.workflow_id = workflow_id
+        self.control = control
         self.result = WorkflowResult()
+        self.checkpoint: dict[str, Any] = {}
+        self.paused_human: dict[str, Any] | None = None
+        self.interrupted = False
 
     async def execute(
         self,
@@ -50,16 +63,32 @@ class WorkflowExecutor:
         conversation_id: str = "",
         user_id: str = "",
         history_messages: list[dict[str, str]] | None = None,
+        checkpoint: dict[str, Any] | None = None,
     ) -> AsyncIterator[RuntimeEvent]:
+        restored = checkpoint or {}
+        self.checkpoint = restored
         context: dict[str, Any] = {
             "query": query,
             "conversation_id": conversation_id,
             "user_id": user_id,
             "history_messages": history_messages or [],
+            **(restored.get("context") if isinstance(restored.get("context"), dict) else {}),
         }
+        self.result = WorkflowResult(
+            answer=str(context.get("_answer") or ""),
+            tool_calls=context.get("_tool_calls") if isinstance(context.get("_tool_calls"), list) else [],
+            retrieved_chunks=(
+                context.get("_retrieved_chunks") if isinstance(context.get("_retrieved_chunks"), list) else []
+            ),
+        )
+        ordered_nodes = self._ordered_nodes(self.workflow_spec)
+        start_node_id = str(restored.get("next_node_id") or "")
+        if start_node_id:
+            ordered_nodes = self._nodes_from(ordered_nodes, start_node_id)
 
-        for node in self._ordered_nodes(self.workflow_spec):
+        for index, node in enumerate(ordered_nodes):
             node_type = self._normalize_type(str(node.get("type", "")))
+            yield {"type": "workflow_node_started", "node_id": node.get("id"), "node_type": node_type}
             if node_type == "start":
                 for event in self._execute_start(node, context):
                     yield event
@@ -69,6 +98,23 @@ class WorkflowExecutor:
             elif node_type == "agent":
                 async for event in self._execute_agent(node, context):
                     yield event
+                if self.interrupted:
+                    self._save_result_to_context(context)
+                    self.checkpoint = {
+                        "next_node_id": str(node.get("id") or "agent"),
+                        "context": context,
+                        "agent_node_id": str(node.get("id") or "agent"),
+                        "agent_interrupted": True,
+                        "agent_state": self.control.checkpoint_agent() if self.control else None,
+                    }
+                    return
+            elif node_type == "human":
+                self._save_result_to_context(context)
+                self.paused_human = self._build_human_task(node)
+                next_node_id = str(ordered_nodes[index + 1].get("id") or "") if index + 1 < len(ordered_nodes) else ""
+                self.checkpoint = {"next_node_id": next_node_id, "context": context}
+                yield {"type": "human_required", **self.paused_human}
+                return
             elif node_type == "end":
                 for event in self._execute_end(node, context):
                     yield event
@@ -80,6 +126,11 @@ class WorkflowExecutor:
                 }
                 add_step(self.db, self.run_id, "workflow_warning", node.get("id", "unknown"), node, event)
                 yield event
+
+            self._save_result_to_context(context)
+            next_node_id = str(ordered_nodes[index + 1].get("id") or "") if index + 1 < len(ordered_nodes) else ""
+            self.checkpoint = {"next_node_id": next_node_id, "context": context}
+            yield {"type": "workflow_checkpoint", "node_id": node.get("id"), "checkpoint": self.checkpoint}
 
     def _execute_start(self, node: dict[str, Any], context: dict[str, Any]):
         output = {"query": context["query"]}
@@ -214,31 +265,91 @@ class WorkflowExecutor:
             },
         ):
             activate_agentscope_tracing_context(get_settings())
-            async for event in adapter.run(invocation):
-                if event["type"] == "tool_call":
-                    tool_call = {**event, "output": None}
-                    self.result.tool_calls.append(tool_call)
-                    tool_calls_by_id[str(event.get("tool_call_id") or "")] = tool_call
-                elif event["type"] == "tool_result":
-                    tool_call = tool_calls_by_id.get(str(event.get("tool_call_id") or ""))
-                    if tool_call is not None:
-                        tool_call["output"] = event.get("output")
-                elif event["type"] == "final":
-                    final_answer = str(event.get("content", ""))
-                    self.result.answer = final_answer
-                elif event["type"] == "adapter_error":
-                    add_step(
-                        self.db,
-                        self.run_id,
-                        "error",
-                        "agent_adapter",
-                        {"node": node},
-                        event,
-                        error=str(event.get("message", "")),
-                    )
+            if self.control and isinstance(adapter, AgentScopeAdapter):
+                try:
+                    session = await adapter.create_session(invocation)
+                    agent_state = self.checkpoint.get("agent_state")
+                    if (
+                        self.checkpoint.get("agent_node_id") == str(node.get("id") or "agent")
+                        and isinstance(agent_state, dict)
+                    ):
+                        session.load_state_dict(agent_state)
+                    self.control.register_session(session)
+                    if self.control.stop_requested and not self.control.has_guidance():
+                        self.interrupted = True
+                        return
+                    if self.checkpoint.get("agent_interrupted"):
+                        turn_input = await self.control.wait_for_guidance()
+                        if turn_input is None:
+                            self.interrupted = True
+                            return
+                    else:
+                        turn_input = invocation.query
+
+                    while turn_input is not None:
+                        next_turn: str | None = None
+                        self.control.set_phase("agent")
+                        async for event in session.run_turn(turn_input):
+                            event_type = event["type"]
+                            if event_type == "thinking_delta":
+                                self.control.set_phase("thinking")
+                            elif event_type == "message_delta":
+                                self.control.set_phase("streaming")
+                            elif event_type == "tool_call":
+                                self.control.set_phase("tool")
+                                tool_call = {**event, "output": None}
+                                self.result.tool_calls.append(tool_call)
+                                tool_calls_by_id[str(event.get("tool_call_id") or "")] = tool_call
+                            elif event_type == "tool_result":
+                                self.control.set_phase("agent")
+                                tool_call = tool_calls_by_id.get(str(event.get("tool_call_id") or ""))
+                                if tool_call is not None:
+                                    tool_call["output"] = event.get("output")
+                            elif event_type == "turn_final":
+                                final_answer = str(event.get("content", ""))
+                                next_turn = self.control.pop_guidance()
+                                if next_turn is None:
+                                    self.result.answer = final_answer
+                                    yield {**event, "type": "final"}
+                            elif event_type == "agent_interrupted":
+                                next_turn = await self.control.wait_for_guidance()
+                                if next_turn is None:
+                                    self.interrupted = True
+                            if event_type != "turn_final":
+                                yield event
+                        if self.interrupted or next_turn is None:
+                            break
+                        turn_input = next_turn
+                except Exception as exc:
+                    event = {"type": "adapter_error", "adapter": adapter.name, "message": str(exc)}
                     yield event
                     return
-                yield event
+            else:
+                async for event in adapter.run(invocation):
+                    if event["type"] == "tool_call":
+                        tool_call = {**event, "output": None}
+                        self.result.tool_calls.append(tool_call)
+                        tool_calls_by_id[str(event.get("tool_call_id") or "")] = tool_call
+                    elif event["type"] == "tool_result":
+                        tool_call = tool_calls_by_id.get(str(event.get("tool_call_id") or ""))
+                        if tool_call is not None:
+                            tool_call["output"] = event.get("output")
+                    elif event["type"] == "final":
+                        final_answer = str(event.get("content", ""))
+                        self.result.answer = final_answer
+                    elif event["type"] == "adapter_error":
+                        add_step(
+                            self.db,
+                            self.run_id,
+                            "error",
+                            "agent_adapter",
+                            {"node": node},
+                            event,
+                            error=str(event.get("message", "")),
+                        )
+                        yield event
+                        return
+                    yield event
 
         add_step(
             self.db,
@@ -308,6 +419,31 @@ class WorkflowExecutor:
             ordered.append(nodes[current])
             current = next_by_source.get(current, "")
         return ordered
+
+    def _nodes_from(self, nodes: list[dict[str, Any]], node_id: str) -> list[dict[str, Any]]:
+        for index, node in enumerate(nodes):
+            if str(node.get("id") or "") == node_id:
+                return nodes[index:]
+        return nodes
+
+    def _build_human_task(self, node: dict[str, Any]) -> dict[str, Any]:
+        input_type = str(node.get("input_type") or "confirm")
+        if input_type not in {"confirm", "text", "json"}:
+            input_type = "text"
+        return {
+            "node_id": str(node.get("id") or "human"),
+            "input_type": input_type,
+            "title": str(node.get("title") or "需要人工输入"),
+            "description": str(node.get("description") or ""),
+            "required": bool(node.get("required", True)),
+            "default": node.get("default"),
+            "output_key": str(node.get("output_key") or "human_input"),
+        }
+
+    def _save_result_to_context(self, context: dict[str, Any]) -> None:
+        context["_answer"] = self.result.answer
+        context["_tool_calls"] = self.result.tool_calls
+        context["_retrieved_chunks"] = self.result.retrieved_chunks
 
     def _normalize_type(self, node_type: str) -> str:
         if node_type in {"agent", "react_agent"}:
