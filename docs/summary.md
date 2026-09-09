@@ -2483,3 +2483,83 @@ Celery Worker 仍然继续执行
 
 Celery负责“在哪个独立进程执行”，数据库 checkpoint 和 AgentScope state 负责“恢复什么执行状态”。
 
+### agentscope-runtime
+
+准确来说，我们手搓了一套“面向项目业务的简化 Runtime 控制面”。
+
+AgentScope Runtime 原生已经覆盖不少能力：
+
+- Redis 分布式中断
+- 任务状态同步
+- SSE 流式响应
+- Agent session/state 保存
+- Celery 任务队列接入
+- Agent 生命周期管理
+- `stop_chat()` 与优雅取消
+
+这与我们实现的 `ExecutionControl`、Redis 命令订阅器、Agent checkpoint、Celery Execution 有明显重叠。[AgentScope Runtime 官方文档](https://runtime.agentscope.io/en/agent_app.html)
+
+但没有完全重复。
+
+**适合交给 AgentScope Runtime 的部分**
+
+```text
+ExecutionControl 的 interrupt 调度
+Redis Pub/Sub 中断通知
+AgentSession state save/load
+Agent 运行状态管理
+Agent SSE 服务层
+Agent 生命周期和任务取消
+```
+
+尤其是最近实现的：
+
+```text
+RuntimeCommandSubscriber
+ExecutionControl._monitor()
+agent.interrupt()
+AgentScope state checkpoint
+```
+
+本质上就是在复刻 AgentScope Runtime 的分布式 interrupt backend。
+
+**仍然需要项目自己维护的部分**
+
+```text
+Workflow Start/Retrieval/Agent/Human/End 节点编排
+Workflow checkpoint 和 next_node_id
+HumanTask 表及人工表单
+Run、Message、RunEvent 的业务持久化
+对话框结构化时间线
+MCP 子 Workflow 状态
+用户权限、App、WorkflowVersion 等业务模型
+```
+
+AgentScope Runtime 管的是“Agent 如何运行和中断”，不知道项目的 Human 节点、检索节点、运行记录和前端时间线。
+
+因此更理想的边界应该是：
+
+```text
+项目 Workflow Runtime
+├── 节点编排
+├── Human 节点
+├── 业务 Run 和 RunEvent
+└── 调用 Agent Runtime
+        └── AgentScope Runtime / AgentScope 2.0
+            ├── Agent session
+            ├── interrupt
+            ├── state
+            ├── streaming
+            └── tool execution
+```
+
+还有一个现实问题：官方目前已经声明独立的 `agentscope-runtime` 即将归档，其能力已合并进 AgentScope 2.0。[官方首页说明](https://runtime.agentscope.io/)
+
+所以现在不适合直接把旧 `agentscope-runtime` 包塞进项目。正确方向应是：
+
+1. 保留现有 Workflow、HumanTask、RunEvent 和前端时间线。
+2. 调研 AgentScope 2.0 的 Runtime 接口。
+3. 用原生 Runtime 替换 `ExecutionControl`、`RuntimeCommandSubscriber` 和部分 Agent checkpoint。
+4. Celery继续负责 Workflow Execution 调度。
+
+结论是：我们确实重复实现了 Agent Runtime 控制能力；但 Workflow HITL 和产品层没有白做。若要收敛架构，应该迁移底层 Agent 控制面，而不是推翻整个 HITL。

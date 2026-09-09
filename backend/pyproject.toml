@@ -2,7 +2,7 @@
 name = "dify-like-backend"
 version = "0.1.0"
 description = "FastAPI backend for a Dify-like AgentScope demo"
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 dependencies = [
   "fastapi>=0.115.0",
   "uvicorn[standard]>=0.30.0",
@@ -24,12 +24,9 @@ dependencies = [
   "langchain-text-splitters>=0.3.0",
   "tiktoken>=0.7.0",
   "jieba>=0.42.1",
-]
-
-[project.optional-dependencies]
-agentscope = [
   "agentscope[full]==1.0.19.post1",
 ]
+[project.optional-dependencies]
 documents = [
   "unstructured[pdf,docx,pptx,xlsx]>=0.18.0",
 ]
